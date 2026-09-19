@@ -75,6 +75,13 @@ interface CanvasSettings {
 
 type ExportSettings = Pick<CanvasSettings, 'width' | 'height' | 'viewBox' | 'defs'>;
 
+// One undo step: everything that ends up in the exported markup
+interface Snapshot extends ExportSettings {
+  elements: SVGElementData[];
+}
+
+type Box = { x: number; y: number; width: number; height: number };
+
 const PRESET_TEMPLATES = [
   {
     name: 'Star Icon',
@@ -104,6 +111,15 @@ const PRESET_TEMPLATES = [
   <text x="200" y="215" fill="#ffffff" font-size="42" font-family="sans-serif" font-weight="bold" text-anchor="middle">SVG ART</text>
 </svg>`
   }
+];
+
+const MAX_HISTORY = 100;
+const FONT_FAMILIES = ['sans-serif', 'serif', 'monospace', 'cursive'];
+const DASH_STYLES = [
+  { label: 'Solid', value: '' },
+  { label: 'Dashed', value: '10 6' },
+  { label: 'Dotted', value: '2 6' },
+  { label: 'Dash-dot', value: '12 4 2 4' }
 ];
 
 /* -------------------------------------------------------------------------- */
@@ -233,6 +249,46 @@ const getTransform = (el: SVGElementData): string | undefined => {
     parts.push(`rotate(${el.rotation} ${round2(c.x)} ${round2(c.y)})`);
   }
   return parts.length ? parts.join(' ') : undefined;
+};
+
+// Add dx/dy to a leading translate(...) if there is one, otherwise prepend a new one.
+// Prepending puts the move in canvas space no matter what transforms the element already carries.
+const TRANSLATE_RE = /^\s*translate\(\s*([-+]?[\d.]+(?:e[-+]?\d+)?)(?:[\s,]+([-+]?[\d.]+(?:e[-+]?\d+)?))?\s*\)\s*(.*)$/i;
+const shiftTransform = (transform: string | undefined, dx: number, dy: number): string => {
+  const m = transform ? TRANSLATE_RE.exec(transform) : null;
+  if (m) {
+    const nx = round2(parseFloat(m[1]) + dx);
+    const ny = round2((m[2] !== undefined ? parseFloat(m[2]) : 0) + dy);
+    return `translate(${nx} ${ny}) ${m[3]}`.trim();
+  }
+  return `translate(${round2(dx)} ${round2(dy)}) ${transform || ''}`.trim();
+};
+
+// Returns a moved copy of an element. Plain shapes get their coordinates edited so the code stays tidy;
+// paths and anything already carrying a transform are moved with a translate() instead.
+const moveElement = (el: SVGElementData, dx: number, dy: number): SVGElementData => {
+  if (el.transform || el.type === 'path') return { ...el, transform: shiftTransform(el.transform, dx, dy) };
+  switch (el.type) {
+    case 'rect':
+      return { ...el, x: round2((el.x || 0) + dx), y: round2((el.y || 0) + dy) };
+    case 'circle':
+      return { ...el, cx: round2((el.cx || 0) + dx), cy: round2((el.cy || 0) + dy) };
+    case 'line':
+      return {
+        ...el,
+        x1: round2((el.x1 || 0) + dx), y1: round2((el.y1 || 0) + dy),
+        x2: round2((el.x2 || 0) + dx), y2: round2((el.y2 || 0) + dy)
+      };
+    case 'text':
+      return { ...el, x: round2((el.x || 0) + dx), y: round2((el.y || 0) + dy) };
+    case 'polygon':
+      return {
+        ...el,
+        points: parsePoints(el.points).map(([x, y]) => `${round2(x + dx)},${round2(y + dy)}`).join(' ')
+      };
+    default:
+      return el;
+  }
 };
 
 // Converts elements array to clean formatted SVG string
@@ -510,6 +566,7 @@ export default function SVGPaintStudio() {
   const [codeError, setCodeError] = useState<boolean>(false);
   const [codeCopied, setCodeCopied] = useState<boolean>(false);
   const [activeViewTab, setActiveViewTab] = useState<'split' | 'canvas' | 'code'>('split');
+  const [notice, setNotice] = useState<string | null>(null);
 
   // Interactive Drawing & Dragging Internal State
   const [isDrawing, setIsDrawing] = useState<boolean>(false);
@@ -835,21 +892,16 @@ export default function SVGPaintStudio() {
 
         {/* Action Controls & Templates */}
         <div className="flex items-center gap-2">
-          {/* Preset Template Selector */}
+          {notice && <span className="text-xs text-rose-300 mr-1">{notice}</span>}
+
+          {/* Preset Template Selector (controlled, so the same preset can be loaded again) */}
           <select
+            value=""
             onChange={(e) => {
               const idx = parseInt(e.target.value, 10);
-              if (!isNaN(idx)) {
-                const parsed = parseSVGToElements(PRESET_TEMPLATES[idx].svg);
-                setElements(parsed.elements);
-                applyParsedSettings(parsed.settings);
-                setSelectedId(null);
-                setHistory([parsed.elements]);
-                setHistoryIndex(0);
-              }
+              if (!isNaN(idx)) loadSvgString(PRESET_TEMPLATES[idx].svg);
             }}
             className="bg-slate-700 text-xs text-slate-200 border border-slate-600 rounded px-2 py-1.5 focus:outline-none focus:border-blue-500"
-            defaultValue=""
           >
             <option value="" disabled>Load Preset Template...</option>
             {PRESET_TEMPLATES.map((tmpl, index) => (
