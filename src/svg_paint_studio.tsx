@@ -1,3 +1,5 @@
+// CHQ: drafted by Gemini AI, modified by Claude AI
+
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
   MousePointer,
@@ -48,7 +50,7 @@ interface SVGElementData {
   strokeDasharray?: string;
   strokeLinecap?: 'butt' | 'round' | 'square';
   strokeLinejoin?: 'miter' | 'round' | 'bevel';
-  transform?: string;
+  transform?: string; // raw transform carried over from imported SVG (own + parent <g> transforms)
   // Shape-specific attributes
   d?: string; // for path
   x1?: number; y1?: number; x2?: number; y2?: number; // for line
@@ -56,6 +58,7 @@ interface SVGElementData {
   cx?: number; cy?: number; r?: number; // for circle
   points?: string; // for polygon
   textContent?: string; fontSize?: number; fontFamily?: string; fontWeight?: string; fontStyle?: string; // for text
+  textAnchor?: 'start' | 'middle' | 'end'; // for text
   rotation?: number;
 }
 
@@ -65,7 +68,12 @@ interface CanvasSettings {
   viewBox: string;
   backgroundColor: string;
   showGrid: boolean;
+  // Raw inner markup of <defs> (gradients, patterns, ...). Kept verbatim so it
+  // survives code <-> canvas round trips even though the editor can't edit it.
+  defs: string;
 }
+
+type ExportSettings = Pick<CanvasSettings, 'width' | 'height' | 'viewBox' | 'defs'>;
 
 const PRESET_TEMPLATES = [
   {
@@ -98,41 +106,83 @@ const PRESET_TEMPLATES = [
   }
 ];
 
-// Converts elements array to clean formatted SVG string
-const elementsToSVG = (elements: SVGElementData[], settings: CanvasSettings): string => {
-  const innerElements = elements.map(el => {
-    const strokeAttrs = `stroke="${el.stroke}" stroke-width="${el.strokeWidth}" stroke-opacity="${el.strokeOpacity}"${
-      el.strokeDasharray ? ` stroke-dasharray="${el.strokeDasharray}"` : ''
-    }${el.strokeLinecap ? ` stroke-linecap="${el.strokeLinecap}"` : ''}${
-      el.strokeLinejoin ? ` stroke-linejoin="${el.strokeLinejoin}"` : ''
-    }`;
-    const fillAttrs = `fill="${el.fill}" fill-opacity="${el.fillOpacity}"`;
-    const transformAttr = el.rotation ? ` transform="rotate(${el.rotation} ${getElementCenter(el).x} ${getElementCenter(el).y})"` : '';
+/* -------------------------------------------------------------------------- */
+/*  Helpers                                                                   */
+/* -------------------------------------------------------------------------- */
 
-    switch (el.type) {
-      case 'path':
-        return `  <path d="${el.d}" ${fillAttrs} ${strokeAttrs}${transformAttr} />`;
-      case 'line':
-        return `  <line x1="${el.x1}" y1="${el.y1}" x2="${el.x2}" y2="${el.y2}" ${strokeAttrs}${transformAttr} />`;
-      case 'rect':
-        return `  <rect x="${el.x}" y="${el.y}" width="${el.width}" height="${el.height}" rx="${el.rx || 0}" ${fillAttrs} ${strokeAttrs}${transformAttr} />`;
-      case 'circle':
-        return `  <circle cx="${el.cx}" cy="${el.cy}" r="${el.r}" ${fillAttrs} ${strokeAttrs}${transformAttr} />`;
-      case 'polygon':
-        return `  <polygon points="${el.points}" ${fillAttrs} ${strokeAttrs}${transformAttr} />`;
-      case 'text':
-        return `  <text x="${el.x}" y="${el.y}" fill="${el.fill}" font-size="${el.fontSize}" font-family="${el.fontFamily}" font-weight="${el.fontWeight}" font-style="${el.fontStyle}" text-anchor="middle"${transformAttr}>${el.textContent}</text>`;
-      default:
-        return '';
-    }
-  }).filter(Boolean).join('\n');
+const SVG_NS = 'http://www.w3.org/2000/svg';
 
-  return `<svg width="${settings.width}" height="${settings.height}" viewBox="${settings.viewBox}" xmlns="http://www.w3.org/2000/svg">
-${innerElements}
-</svg>`;
+const round2 = (n: number) => Math.round(n * 100) / 100;
+
+// Escape a value for use in XML text or a double-quoted attribute
+const esc = (v: unknown): string =>
+  String(v ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+
+// Internal "transparent" <-> SVG "none"
+const paint = (v: string) => (v === 'transparent' ? 'none' : v);
+
+const normPaint = (v: string | undefined, fallback: string): string => {
+  if (v === undefined || v.trim() === '') return fallback;
+  const t = v.trim();
+  if (t === 'none') return 'transparent';
+  if (t.toLowerCase() === 'currentcolor') return '#000000';
+  return t;
 };
 
-// Calculate center point of an element for rotation transforms
+const num = (v: string | null | undefined, fallback: number): number => {
+  const n = parseFloat(v ?? '');
+  return Number.isFinite(n) ? n : fallback;
+};
+
+// <input type="color"> only accepts #rrggbb
+const toColorInput = (c: string) => (/^#[0-9a-f]{6}$/i.test(c) ? c : '#000000');
+
+const parsePoints = (points?: string): [number, number][] => {
+  const nums = (points || '').trim().split(/[\s,]+/).filter(Boolean).map(Number).filter(Number.isFinite);
+  const out: [number, number][] = [];
+  for (let i = 0; i + 1 < nums.length; i += 2) out.push([nums[i], nums[i + 1]]);
+  return out;
+};
+
+// Measure real geometry (paths, text) with a hidden <svg> so we get an exact bounding box
+type Box = { x: number; y: number; width: number; height: number };
+let measureSvg: SVGSVGElement | null = null;
+const bboxCache = new Map<string, Box>();
+
+const measureBBox = (tag: 'path' | 'text', attrs: Record<string, string>, text?: string): Box | null => {
+  if (typeof document === 'undefined') return null;
+  const key = tag + JSON.stringify(attrs) + (text ?? '');
+  const cached = bboxCache.get(key);
+  if (cached) return cached;
+  try {
+    if (!measureSvg || !measureSvg.isConnected) {
+      measureSvg = document.createElementNS(SVG_NS, 'svg') as SVGSVGElement;
+      measureSvg.setAttribute('width', '1');
+      measureSvg.setAttribute('height', '1');
+      measureSvg.setAttribute('aria-hidden', 'true');
+      measureSvg.style.cssText = 'position:absolute;left:-9999px;top:0;visibility:hidden;pointer-events:none;overflow:visible';
+      document.body.appendChild(measureSvg);
+    }
+    const node = document.createElementNS(SVG_NS, tag) as SVGGraphicsElement;
+    Object.entries(attrs).forEach(([k, v]) => node.setAttribute(k, v));
+    if (text !== undefined) node.textContent = text;
+    measureSvg.appendChild(node);
+    const b = node.getBBox();
+    measureSvg.removeChild(node);
+    const box = { x: b.x, y: b.y, width: b.width, height: b.height };
+    if (bboxCache.size > 500) bboxCache.clear();
+    bboxCache.set(key, box);
+    return box;
+  } catch {
+    return null;
+  }
+};
+
+// Center of an element's geometry, used as the pivot for rotation
 const getElementCenter = (el: SVGElementData): { x: number; y: number } => {
   switch (el.type) {
     case 'rect':
@@ -141,101 +191,284 @@ const getElementCenter = (el: SVGElementData): { x: number; y: number } => {
       return { x: el.cx || 0, y: el.cy || 0 };
     case 'line':
       return { x: ((el.x1 || 0) + (el.x2 || 0)) / 2, y: ((el.y1 || 0) + (el.y2 || 0)) / 2 };
-    case 'text':
-      return { x: el.x || 0, y: el.y || 0 };
+    case 'polygon': {
+      const pts = parsePoints(el.points);
+      if (!pts.length) return { x: 0, y: 0 };
+      const xs = pts.map(p => p[0]);
+      const ys = pts.map(p => p[1]);
+      return { x: (Math.min(...xs) + Math.max(...xs)) / 2, y: (Math.min(...ys) + Math.max(...ys)) / 2 };
+    }
+    case 'path': {
+      const box = measureBBox('path', { d: el.d || '' });
+      return box ? { x: box.x + box.width / 2, y: box.y + box.height / 2 } : { x: 0, y: 0 };
+    }
+    case 'text': {
+      const box = measureBBox(
+        'text',
+        {
+          x: String(el.x ?? 0),
+          y: String(el.y ?? 0),
+          'font-size': String(el.fontSize ?? 16),
+          'font-family': el.fontFamily || 'sans-serif',
+          'font-weight': el.fontWeight || 'normal',
+          'font-style': el.fontStyle || 'normal',
+          'text-anchor': el.textAnchor || 'middle'
+        },
+        el.textContent || ''
+      );
+      return box ? { x: box.x + box.width / 2, y: box.y + box.height / 2 } : { x: el.x || 0, y: el.y || 0 };
+    }
     default:
-      return { x: el.x || 0, y: el.y || 0 };
+      return { x: 0, y: 0 };
   }
 };
 
-// Expanded SVG string parser supporting <defs>, <style>, <g>, and complex elements
-const parseSVGToElements = (svgString: string): { elements: SVGElementData[]; settings: CanvasSettings } => {
-  let cleanedInput = svgString.trim();
-
-  if (!cleanedInput.startsWith('<svg')) {
-    cleanedInput = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 700 600" width="700" height="600">${cleanedInput}</svg>`;
+// Combined transform: imported transform first, then our rotation about the element's center.
+// Used by both the canvas and the exported code so they always agree.
+const getTransform = (el: SVGElementData): string | undefined => {
+  const parts: string[] = [];
+  if (el.transform) parts.push(el.transform);
+  if (el.rotation) {
+    const c = getElementCenter(el);
+    parts.push(`rotate(${el.rotation} ${round2(c.x)} ${round2(c.y)})`);
   }
+  return parts.length ? parts.join(' ') : undefined;
+};
 
-  const parser = new DOMParser();
-  const doc = parser.parseFromString(cleanedInput, 'image/svg+xml');
-  const svgEl = doc.querySelector('svg');
+// Converts elements array to clean formatted SVG string
+const elementsToSVG = (elements: SVGElementData[], settings: ExportSettings): string => {
+  const innerElements = elements.map(el => {
+    const fillAttrs = `fill="${esc(paint(el.fill))}" fill-opacity="${el.fillOpacity}"`;
+    const strokeAttrs = [
+      `stroke="${esc(paint(el.stroke))}"`,
+      `stroke-width="${el.strokeWidth}"`,
+      `stroke-opacity="${el.strokeOpacity}"`,
+      el.strokeDasharray ? `stroke-dasharray="${esc(el.strokeDasharray)}"` : '',
+      el.strokeLinecap ? `stroke-linecap="${el.strokeLinecap}"` : '',
+      el.strokeLinejoin ? `stroke-linejoin="${el.strokeLinejoin}"` : ''
+    ].filter(Boolean).join(' ');
+    const tf = getTransform(el);
+    const transformAttr = tf ? ` transform="${esc(tf)}"` : '';
 
-  if (!svgEl) return { elements: [], settings: { width: 700, height: 600, viewBox: '0 0 700 600', backgroundColor: 'transparent', showGrid: true } };
-
-  // Parse CSS rules from embedded <style> tags
-  const styleMap: Record<string, Record<string, string>> = {};
-  doc.querySelectorAll('style').forEach(styleTag => {
-    const cssText = styleTag.textContent || '';
-    const rules = cssText.match(/(\.[^{]+)\s*\{([^}]+)\}/g) || [];
-    rules.forEach(rule => {
-      const match = rule.match(/\.([^{]+)\s*\{([^}]+)\}/);
-      if (match) {
-        const className = match[1].trim();
-        const declarations = match[2].split(';');
-        styleMap[className] = styleMap[className] || {};
-        declarations.forEach(decl => {
-          const [prop, val] = decl.split(':').map(s => s?.trim());
-          if (prop && val) styleMap[className][prop] = val;
-        });
+    switch (el.type) {
+      case 'path':
+        return `  <path d="${esc(el.d)}" ${fillAttrs} ${strokeAttrs}${transformAttr} />`;
+      case 'line':
+        return `  <line x1="${el.x1}" y1="${el.y1}" x2="${el.x2}" y2="${el.y2}" ${strokeAttrs}${transformAttr} />`;
+      case 'rect':
+        return `  <rect x="${el.x}" y="${el.y}" width="${el.width}" height="${el.height}" rx="${el.rx || 0}" ${fillAttrs} ${strokeAttrs}${transformAttr} />`;
+      case 'circle':
+        return `  <circle cx="${el.cx}" cy="${el.cy}" r="${el.r}" ${fillAttrs} ${strokeAttrs}${transformAttr} />`;
+      case 'polygon':
+        return `  <polygon points="${esc(el.points)}" ${fillAttrs} ${strokeAttrs}${transformAttr} />`;
+      case 'text': {
+        const textStroke = el.stroke !== 'transparent' && el.strokeWidth > 0 ? ` ${strokeAttrs}` : '';
+        return `  <text x="${el.x}" y="${el.y}" ${fillAttrs}${textStroke} font-size="${el.fontSize}" font-family="${esc(el.fontFamily)}" font-weight="${esc(el.fontWeight)}" font-style="${esc(el.fontStyle)}" text-anchor="${el.textAnchor || 'middle'}"${transformAttr}>${esc(el.textContent)}</text>`;
       }
+      default:
+        return '';
+    }
+  }).filter(Boolean).join('\n');
+
+  const defsBlock = settings.defs.trim() ? `  <defs>\n${settings.defs}\n  </defs>\n` : '';
+
+  return `<svg width="${settings.width}" height="${settings.height}" viewBox="${esc(settings.viewBox)}" xmlns="${SVG_NS}">
+${defsBlock}${innerElements}
+</svg>`;
+};
+
+// Presentation properties that cascade from <svg>/<g> down to shapes
+const INHERITED_PROPS = [
+  'fill', 'fill-opacity', 'stroke', 'stroke-width', 'stroke-opacity',
+  'stroke-dasharray', 'stroke-linecap', 'stroke-linejoin',
+  'font-family', 'font-size', 'font-weight', 'font-style', 'text-anchor'
+];
+
+const parseStyleDecls = (text: string): Record<string, string> => {
+  const out: Record<string, string> = {};
+  text.split(';').forEach(decl => {
+    const i = decl.indexOf(':');
+    if (i === -1) return;
+    const prop = decl.slice(0, i).trim();
+    const val = decl.slice(i + 1).trim();
+    if (prop && val) out[prop] = val;
+  });
+  return out;
+};
+
+// Strip anything executable from markup we re-inject via innerHTML
+const sanitizeNode = (root: Element) => {
+  root.querySelectorAll('script, foreignObject').forEach(n => n.remove());
+  [root, ...Array.from(root.querySelectorAll('*'))].forEach(n => {
+    Array.from(n.attributes).forEach(a => {
+      if (/^on/i.test(a.name) || /^\s*javascript:/i.test(a.value)) n.removeAttribute(a.name);
     });
   });
+};
 
-  const width = parseInt(svgEl.getAttribute('width') || '700', 10);
-  const height = parseInt(svgEl.getAttribute('height') || '600', 10);
-  const viewBox = svgEl.getAttribute('viewBox') || `0 0 ${width} ${height}`;
+// SVG string parser: handles <defs>, <style> classes, inline style, <g> inheritance, transforms, text.
+// Throws if the markup is not well-formed XML.
+const parseSVGToElements = (svgString: string): { elements: SVGElementData[]; settings: CanvasSettings } => {
+  let input = svgString.trim();
+
+  // Wrap bare fragments; anything with an <svg> tag (even after an <?xml?> prolog or comments) is parsed as-is
+  if (!/<svg[\s>]/i.test(input)) {
+    input = `<svg xmlns="${SVG_NS}" viewBox="0 0 700 600" width="700" height="600">${input}</svg>`;
+  }
+
+  const doc = new DOMParser().parseFromString(input, 'image/svg+xml');
+  if (doc.querySelector('parsererror')) throw new Error('Invalid SVG markup');
+  const svgEl = doc.querySelector('svg');
+  if (!svgEl) throw new Error('No <svg> element found');
+
+  // CSS rules from embedded <style> tags (simple .class selectors, including comma groups)
+  const styleMap: Record<string, Record<string, string>> = {};
+  doc.querySelectorAll('style').forEach(tag => {
+    const css = (tag.textContent || '').replace(/\/\*[\s\S]*?\*\//g, '');
+    const ruleRe = /([^{}]+)\{([^}]*)\}/g;
+    let m: RegExpExecArray | null;
+    while ((m = ruleRe.exec(css)) !== null) {
+      const decls = parseStyleDecls(m[2]);
+      m[1].split(',').map(s => s.trim()).filter(s => /^\.[\w-]+$/.test(s)).forEach(sel => {
+        const cls = sel.slice(1);
+        styleMap[cls] = { ...styleMap[cls], ...decls };
+      });
+    }
+  });
+
+  // Presentation attributes < class rules < inline style (CSS precedence)
+  const readProps = (node: Element): Record<string, string> => {
+    const out: Record<string, string> = {};
+    INHERITED_PROPS.forEach(p => {
+      const v = node.getAttribute(p);
+      if (v !== null) out[p] = v;
+    });
+    (node.getAttribute('class') || '').split(/\s+/).filter(Boolean).forEach(c => Object.assign(out, styleMap[c] || {}));
+    Object.assign(out, parseStyleDecls(node.getAttribute('style') || ''));
+    return out;
+  };
+
+  // Canvas size: honor width/height, fall back to viewBox, then to defaults
+  const readLen = (v: string | null) => (v && !v.trim().endsWith('%') ? parseFloat(v) : NaN);
+  const vb = (svgEl.getAttribute('viewBox') || '').trim().split(/[\s,]+/).map(Number);
+  const vbValid = vb.length === 4 && vb.every(Number.isFinite) && vb[2] > 0 && vb[3] > 0;
+  let width = readLen(svgEl.getAttribute('width'));
+  let height = readLen(svgEl.getAttribute('height'));
+  if (vbValid) {
+    if (!Number.isFinite(width) && !Number.isFinite(height)) {
+      const s = 480 / Math.max(vb[2], vb[3]);
+      width = vb[2] * s;
+      height = vb[3] * s;
+    } else if (!Number.isFinite(width)) {
+      width = (height * vb[2]) / vb[3];
+    } else if (!Number.isFinite(height)) {
+      height = (width * vb[3]) / vb[2];
+    }
+  }
+  if (!Number.isFinite(width)) width = 700;
+  if (!Number.isFinite(height)) height = 600;
+  width = Math.round(width);
+  height = Math.round(height);
+  const viewBox = vbValid ? vb.join(' ') : `0 0 ${width} ${height}`;
+
+  // Preserve <defs> contents (gradients etc.) verbatim
+  const defsParts: string[] = [];
+  const serializer = new XMLSerializer();
+  const keepInDefs = (node: Element) => {
+    const tag = node.tagName.toLowerCase();
+    if (tag === 'script' || tag === 'foreignobject') return;
+    const clone = node.cloneNode(true) as Element;
+    sanitizeNode(clone);
+    defsParts.push('    ' + serializer.serializeToString(clone));
+  };
+  doc.querySelectorAll('defs > *').forEach(child => {
+    if (child.tagName.toLowerCase() !== 'style') keepInDefs(child);
+  });
 
   const elements: SVGElementData[] = [];
+  let counter = 0;
 
-  const traverseNodes = (nodes: Element[]) => {
-    nodes.forEach((node, index) => {
-      const tagName = node.tagName.toLowerCase();
+  const traverse = (nodes: Element[], inherited: Record<string, string>, parentTransform: string) => {
+    nodes.forEach(node => {
+      const tag = node.tagName.toLowerCase();
 
-      if (['defs', 'style', 'filter', 'metadata', 'title', 'desc'].includes(tagName)) return;
-
-      if (tagName === 'g') {
-        traverseNodes(Array.from(node.children));
+      if (['defs', 'style', 'metadata', 'title', 'desc'].includes(tag)) return;
+      if (['lineargradient', 'radialgradient', 'pattern'].includes(tag)) {
+        keepInDefs(node);
         return;
       }
 
-      // Merge inline attributes with CSS class styles
-      const classes = (node.getAttribute('class') || '').split(' ').filter(Boolean);
-      let mergedStyles: Record<string, string> = {};
-      classes.forEach(c => {
-        if (styleMap[c]) Object.assign(mergedStyles, styleMap[c]);
-      });
+      const props = { ...inherited, ...readProps(node) };
+      const transform = [parentTransform, node.getAttribute('transform') || ''].filter(Boolean).join(' ');
 
-      const fill = node.getAttribute('fill') || mergedStyles['fill'] || 'transparent';
-      const stroke = node.getAttribute('stroke') || mergedStyles['stroke'] || 'transparent';
-      const strokeWidth = parseFloat(node.getAttribute('stroke-width') || mergedStyles['stroke-width'] || '1');
+      if (tag === 'g') {
+        traverse(Array.from(node.children), props, transform);
+        return;
+      }
 
-      const id = node.getAttribute('id') || `el-${Date.now()}-${index}-${Math.random().toString(36).substring(2, 6)}`;
-
-      const baseEl = {
-        id,
-        fill: fill === 'none' ? 'transparent' : fill,
-        fillOpacity: parseFloat(node.getAttribute('fill-opacity') || '1'),
-        stroke: stroke === 'none' ? 'transparent' : stroke,
-        strokeWidth,
-        strokeOpacity: parseFloat(node.getAttribute('stroke-opacity') || mergedStyles['opacity'] || '1'),
-        strokeDasharray: node.getAttribute('stroke-dasharray') || '',
-        strokeLinecap: (node.getAttribute('stroke-linecap') || mergedStyles['stroke-linecap'] || undefined) as any,
-        strokeLinejoin: (node.getAttribute('stroke-linejoin') || mergedStyles['stroke-linejoin'] || undefined) as any,
+      const base = {
+        id: node.getAttribute('id') || `el-${Date.now()}-${counter++}-${Math.random().toString(36).substring(2, 6)}`,
+        fill: normPaint(props['fill'], '#000000'), // SVG default fill is black
+        fillOpacity: num(props['fill-opacity'], 1),
+        stroke: normPaint(props['stroke'], 'transparent'),
+        strokeWidth: num(props['stroke-width'], 1),
+        strokeOpacity: num(props['stroke-opacity'], 1),
+        strokeDasharray: props['stroke-dasharray'] && props['stroke-dasharray'] !== 'none' ? props['stroke-dasharray'] : '',
+        strokeLinecap: props['stroke-linecap'] as SVGElementData['strokeLinecap'],
+        strokeLinejoin: props['stroke-linejoin'] as SVGElementData['strokeLinejoin'],
+        transform: transform || undefined,
         rotation: 0
       };
 
-      if (tagName === 'path') elements.push({ ...baseEl, type: 'path', d: node.getAttribute('d') || '' });
-      else if (tagName === 'rect') elements.push({ ...baseEl, type: 'rect', x: parseFloat(node.getAttribute('x') || '0'), y: parseFloat(node.getAttribute('y') || '0'), width: parseFloat(node.getAttribute('width') || '50'), height: parseFloat(node.getAttribute('height') || '50'), rx: parseFloat(node.getAttribute('rx') || '0') });
-      else if (tagName === 'circle') elements.push({ ...baseEl, type: 'circle', cx: parseFloat(node.getAttribute('cx') || '0'), cy: parseFloat(node.getAttribute('cy') || '0'), r: parseFloat(node.getAttribute('r') || '25') });
-      else if (tagName === 'line') elements.push({ ...baseEl, type: 'line', x1: parseFloat(node.getAttribute('x1') || '0'), y1: parseFloat(node.getAttribute('y1') || '0'), x2: parseFloat(node.getAttribute('x2') || '50'), y2: parseFloat(node.getAttribute('y2') || '50') });
-      else if (tagName === 'polyline' || tagName === 'polygon') elements.push({ ...baseEl, type: 'polygon', points: node.getAttribute('points') || '' });
+      if (tag === 'path') {
+        elements.push({ ...base, type: 'path', d: node.getAttribute('d') || '' });
+      } else if (tag === 'rect') {
+        elements.push({
+          ...base, type: 'rect',
+          x: num(node.getAttribute('x'), 0), y: num(node.getAttribute('y'), 0),
+          width: num(node.getAttribute('width'), 50), height: num(node.getAttribute('height'), 50),
+          rx: num(node.getAttribute('rx'), 0)
+        });
+      } else if (tag === 'circle') {
+        elements.push({
+          ...base, type: 'circle',
+          cx: num(node.getAttribute('cx'), 0), cy: num(node.getAttribute('cy'), 0), r: num(node.getAttribute('r'), 25)
+        });
+      } else if (tag === 'line') {
+        elements.push({
+          ...base, type: 'line',
+          x1: num(node.getAttribute('x1'), 0), y1: num(node.getAttribute('y1'), 0),
+          x2: num(node.getAttribute('x2'), 50), y2: num(node.getAttribute('y2'), 50)
+        });
+      } else if (tag === 'polyline' || tag === 'polygon') {
+        elements.push({ ...base, type: 'polygon', points: node.getAttribute('points') || '' });
+      } else if (tag === 'text') {
+        const anchor = props['text-anchor'];
+        elements.push({
+          ...base, type: 'text',
+          x: num(node.getAttribute('x'), 0), y: num(node.getAttribute('y'), 0),
+          textContent: (node.textContent || '').replace(/\s+/g, ' ').trim(),
+          fontSize: num(props['font-size'], 16),
+          fontFamily: props['font-family'] || 'sans-serif',
+          fontWeight: props['font-weight'] || 'normal',
+          fontStyle: props['font-style'] || 'normal',
+          textAnchor: anchor === 'middle' || anchor === 'end' ? anchor : 'start'
+        });
+      }
     });
   };
 
-  traverseNodes(Array.from(svgEl.children));
+  traverse(Array.from(svgEl.children), readProps(svgEl), svgEl.getAttribute('transform') || '');
 
-  return { elements, settings: { width, height, viewBox, backgroundColor: 'transparent', showGrid: true } };
+  return {
+    elements,
+    settings: { width, height, viewBox, defs: defsParts.join('\n'), backgroundColor: 'transparent', showGrid: true }
+  };
 };
+
+/* -------------------------------------------------------------------------- */
+/*  Component                                                                 */
+/* -------------------------------------------------------------------------- */
 
 export default function SVGPaintStudio() {
   // Canvas Settings State
@@ -244,7 +477,8 @@ export default function SVGPaintStudio() {
     height: 500,
     viewBox: '0 0 600 500',
     backgroundColor: '#ffffff',
-    showGrid: true
+    showGrid: true,
+    defs: ''
   });
 
   // Vector Elements State & History Stack
@@ -264,7 +498,7 @@ export default function SVGPaintStudio() {
   const [strokeOpacity, setStrokeOpacity] = useState<number>(1);
   const [cornerRadius, setCornerRadius] = useState<number>(0);
   const [strokeDash, setStrokeDash] = useState<string>('');
-  
+
   // Text Tool options
   const [fontSize, setFontSize] = useState<number>(28);
   const [fontFamily, setFontFamily] = useState<string>('sans-serif');
@@ -273,6 +507,7 @@ export default function SVGPaintStudio() {
 
   // Realtime Raw SVG Code Textarea
   const [svgCode, setSvgCode] = useState<string>('');
+  const [codeError, setCodeError] = useState<boolean>(false);
   const [codeCopied, setCodeCopied] = useState<boolean>(false);
   const [activeViewTab, setActiveViewTab] = useState<'split' | 'canvas' | 'code'>('split');
 
@@ -283,6 +518,9 @@ export default function SVGPaintStudio() {
   const [zoomLevel, setZoomLevel] = useState<number>(1);
 
   const svgRef = useRef<SVGSVGElement | null>(null);
+  // Set when the change came from typing in the code editor, so the sync effect
+  // below doesn't rewrite (and reformat) the text the user is typing.
+  const skipCodeSyncRef = useRef<boolean>(false);
 
   // Record changes to history stack
   const updateElementsWithHistory = useCallback((newElements: SVGElementData[]) => {
@@ -292,20 +530,30 @@ export default function SVGPaintStudio() {
     setHistoryIndex(newHistory.length);
   }, [history, historyIndex]);
 
-  // Sync canvas state to SVG code output whenever elements change
+  const applyParsedSettings = useCallback((s: CanvasSettings) => {
+    setCanvasSettings(prev => ({ ...prev, width: s.width, height: s.height, viewBox: s.viewBox, defs: s.defs }));
+  }, []);
+
+  // Sync canvas state to SVG code output whenever the drawing changes.
+  // Only depends on settings that appear in the markup (not e.g. the grid toggle).
+  const { width: cw, height: ch, viewBox: cvb, defs: cdefs } = canvasSettings;
   useEffect(() => {
-    const code = elementsToSVG(elements, canvasSettings);
-    setSvgCode(code);
-  }, [elements, canvasSettings]);
+    if (skipCodeSyncRef.current) {
+      skipCodeSyncRef.current = false;
+      return;
+    }
+    setSvgCode(elementsToSVG(elements, { width: cw, height: ch, viewBox: cvb, defs: cdefs }));
+    setCodeError(false);
+  }, [elements, cw, ch, cvb, cdefs]);
 
   // Initialize with star template on initial load
   useEffect(() => {
     const parsed = parseSVGToElements(PRESET_TEMPLATES[0].svg);
     setElements(parsed.elements);
-    setCanvasSettings(prev => ({ ...prev, width: parsed.settings.width, height: parsed.settings.height, viewBox: parsed.settings.viewBox }));
+    applyParsedSettings(parsed.settings);
     setHistory([parsed.elements]);
     setHistoryIndex(0);
-  }, []);
+  }, [applyParsedSettings]);
 
   // Undo / Redo
   const handleUndo = () => {
@@ -328,22 +576,27 @@ export default function SVGPaintStudio() {
     setSvgCode(val);
     try {
       const parsed = parseSVGToElements(val);
-      if (parsed.elements.length > 0 || val.trim() === '') {
-        setElements(parsed.elements);
-        setCanvasSettings(prev => ({ ...prev, width: parsed.settings.width, height: parsed.settings.height, viewBox: parsed.settings.viewBox }));
-      }
+      skipCodeSyncRef.current = true; // keep the user's text exactly as typed
+      setElements(parsed.elements);
+      applyParsedSettings(parsed.settings);
+      setSelectedId(null);
+      setCodeError(false);
     } catch {
-      // Ignore syntax errors while typing
+      // Not well-formed yet (mid-typing): keep the last valid canvas and flag it
+      setCodeError(true);
     }
   };
 
-  // Get SVG mouse coordinates relative to SVG viewBox
+  // Map mouse position into SVG user space (respects viewBox, sizing and zoom)
   const getCanvasCoords = (e: React.MouseEvent<SVGSVGElement>) => {
-    if (!svgRef.current) return { x: 0, y: 0 };
-    const rect = svgRef.current.getBoundingClientRect();
-    const x = (e.clientX - rect.left) * (canvasSettings.width / rect.width);
-    const y = (e.clientY - rect.top) * (canvasSettings.height / rect.height);
-    return { x: Math.round(x), y: Math.round(y) };
+    const svg = svgRef.current;
+    const ctm = svg?.getScreenCTM();
+    if (!svg || !ctm) return { x: 0, y: 0 };
+    const pt = svg.createSVGPoint();
+    pt.x = e.clientX;
+    pt.y = e.clientY;
+    const p = pt.matrixTransform(ctm.inverse());
+    return { x: round2(p.x), y: round2(p.y) };
   };
 
   const handleMouseDown = (e: React.MouseEvent<SVGSVGElement>) => {
@@ -411,6 +664,7 @@ export default function SVGPaintStudio() {
         fontSize, fontFamily,
         fontWeight: isBold ? 'bold' : 'normal',
         fontStyle: isItalic ? 'italic' : 'normal',
+        textAnchor: 'middle',
         fill: fillColor, fillOpacity,
         stroke: 'transparent', strokeWidth: 0, strokeOpacity: 1
       };
@@ -436,14 +690,14 @@ export default function SVGPaintStudio() {
       const height = Math.abs(coords.y - dragStart.y);
       setElements(prev => prev.map(el => el.id === selectedId ? { ...el, x, y, width, height } : el));
     } else if (activeTool === 'circle') {
-      const r = Math.round(Math.sqrt(Math.pow(coords.x - dragStart.x, 2) + Math.pow(coords.y - dragStart.y, 2)));
+      const r = round2(Math.sqrt(Math.pow(coords.x - dragStart.x, 2) + Math.pow(coords.y - dragStart.y, 2)));
       setElements(prev => prev.map(el => el.id === selectedId ? { ...el, r } : el));
     } else if (activeTool === 'triangle') {
       const x1 = dragStart.x;
       const y1 = dragStart.y;
       const x2 = coords.x;
       const y2 = coords.y;
-      const x3 = x1 - (x2 - x1);
+      const x3 = round2(x1 - (x2 - x1));
       const points = `${x1},${y1} ${x2},${y2} ${x3},${y2}`;
       setElements(prev => prev.map(el => el.id === selectedId ? { ...el, points } : el));
     }
@@ -563,7 +817,7 @@ export default function SVGPaintStudio() {
 
   return (
     <div className="flex flex-col h-screen w-screen bg-slate-900 text-slate-100 font-sans overflow-hidden">
-      {}
+      {/* HEADER */}
       <header className="h-14 bg-slate-800 border-b border-slate-700 px-4 flex items-center justify-between z-10">
         <div className="flex items-center gap-3">
           <div className="p-2 bg-blue-600 rounded-lg flex items-center justify-center text-white">
@@ -588,7 +842,8 @@ export default function SVGPaintStudio() {
               if (!isNaN(idx)) {
                 const parsed = parseSVGToElements(PRESET_TEMPLATES[idx].svg);
                 setElements(parsed.elements);
-                setCanvasSettings(prev => ({ ...prev, width: parsed.settings.width, height: parsed.settings.height, viewBox: parsed.settings.viewBox }));
+                applyParsedSettings(parsed.settings);
+                setSelectedId(null);
                 setHistory([parsed.elements]);
                 setHistoryIndex(0);
               }
@@ -638,7 +893,7 @@ export default function SVGPaintStudio() {
         </div>
       </header>
 
-      {}
+      {/* BODY */}
       <div className="flex-1 flex overflow-hidden">
         {/* LEFT TOOLBAR: Drawing Tools */}
         <aside className="w-16 bg-slate-800 border-r border-slate-700 flex flex-col items-center py-3 gap-2 z-10">
@@ -740,7 +995,7 @@ export default function SVGPaintStudio() {
             </div>
           </div>
 
-          {}
+          {/* Canvas + Code panes */}
           <div className="flex-1 flex overflow-hidden relative">
             {/* CANVAS WORKSPACE PANEL */}
             {(activeViewTab === 'split' || activeViewTab === 'canvas') && (
@@ -768,6 +1023,9 @@ export default function SVGPaintStudio() {
                       onMouseUp={handleMouseUp}
                       className="cursor-crosshair block"
                     >
+                      {/* Gradients, patterns etc. carried over from imported SVG */}
+                      {canvasSettings.defs && <defs dangerouslySetInnerHTML={{ __html: canvasSettings.defs }} />}
+
                       {/* Rendered SVG Elements */}
                       {elements.map((el) => {
                         const isSelected = selectedId === el.id;
@@ -780,7 +1038,7 @@ export default function SVGPaintStudio() {
                           strokeLinejoin: el.strokeLinejoin,
                         };
 
-                        const transform = el.rotation ? `rotate(${el.rotation} ${getElementCenter(el).x} ${getElementCenter(el).y})` : undefined;
+                        const transform = getTransform(el);
 
                         return (
                           <g key={el.id} onClick={(e) => handleElementClick(e, el.id)}>
@@ -802,17 +1060,18 @@ export default function SVGPaintStudio() {
                             {el.type === 'text' && (
                               <text
                                 x={el.x} y={el.y} fill={el.fill} fillOpacity={el.fillOpacity}
+                                {...strokeAttrs}
                                 fontSize={el.fontSize} fontFamily={el.fontFamily}
                                 fontWeight={el.fontWeight} fontStyle={el.fontStyle}
-                                textAnchor="middle" transform={transform}
+                                textAnchor={el.textAnchor || 'middle'} transform={transform}
                               >
                                 {el.textContent}
                               </text>
                             )}
 
-                            {/* Render Active Selection Bounding Box & Handles */}
+                            {/* Render Active Selection Bounding Box (follows the element's transform) */}
                             {isSelected && (
-                              <g className="pointer-events-none">
+                              <g className="pointer-events-none" transform={transform}>
                                 {el.type === 'rect' && (
                                   <rect
                                     x={(el.x || 0) - 4} y={(el.y || 0) - 4}
@@ -869,6 +1128,12 @@ export default function SVGPaintStudio() {
                   </button>
                 </div>
 
+                {codeError && (
+                  <div className="px-3 py-1.5 text-[11px] text-amber-300 bg-amber-500/10 border-b border-amber-500/30">
+                    Invalid SVG markup. The canvas is showing the last valid version.
+                  </div>
+                )}
+
                 <textarea
                   value={svgCode}
                   onChange={handleCodeChange}
@@ -881,7 +1146,7 @@ export default function SVGPaintStudio() {
           </div>
         </main>
 
-        {}
+        {/* RIGHT PANEL: Settings, Inspector, Layers */}
         <aside className="w-72 bg-slate-800 border-l border-slate-700 flex flex-col overflow-y-auto text-xs z-10">
           {/* Canvas Dimensions Section */}
           <div className="p-4 border-b border-slate-700 space-y-3">
@@ -939,7 +1204,7 @@ export default function SVGPaintStudio() {
               <div className="flex gap-2">
                 <input
                   type="color"
-                  value={fillColor === 'transparent' ? '#000000' : fillColor}
+                  value={toColorInput(fillColor)}
                   onChange={(e) => {
                     setFillColor(e.target.value);
                     if (selectedId) updateSelectedElement('fill', e.target.value);
@@ -964,7 +1229,7 @@ export default function SVGPaintStudio() {
               <div className="flex gap-2">
                 <input
                   type="color"
-                  value={strokeColor === 'transparent' ? '#000000' : strokeColor}
+                  value={toColorInput(strokeColor)}
                   onChange={(e) => {
                     setStrokeColor(e.target.value);
                     if (selectedId) updateSelectedElement('stroke', e.target.value);
@@ -1024,7 +1289,7 @@ export default function SVGPaintStudio() {
             </div>
           </div>
 
-          {}
+          {/* ELEMENT INSPECTOR */}
           {selectedElement && (
             <div className="p-4 border-b border-slate-700 space-y-3 bg-slate-800/50">
               <div className="flex items-center justify-between">
