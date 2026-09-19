@@ -50,7 +50,7 @@ interface SVGElementData {
   strokeDasharray?: string;
   strokeLinecap?: 'butt' | 'round' | 'square';
   strokeLinejoin?: 'miter' | 'round' | 'bevel';
-  transform?: string; // raw transform carried over from imported SVG (own + parent <g> transforms)
+  transform?: string; // raw transform carried over from imported SVG (own + parent <g> transforms), also used to move paths
   // Shape-specific attributes
   d?: string; // for path
   x1?: number; y1?: number; x2?: number; y2?: number; // for line
@@ -148,8 +148,10 @@ const parsePoints = (points?: string): [number, number][] => {
   return out;
 };
 
+const sameSnapshot = (a: Snapshot, b: Snapshot) =>
+  a.elements === b.elements && a.width === b.width && a.height === b.height && a.viewBox === b.viewBox && a.defs === b.defs;
+
 // Measure real geometry (paths, text) with a hidden <svg> so we get an exact bounding box
-type Box = { x: number; y: number; width: number; height: number };
 let measureSvg: SVGSVGElement | null = null;
 const bboxCache = new Map<string, Box>();
 
@@ -182,28 +184,31 @@ const measureBBox = (tag: 'path' | 'text', attrs: Record<string, string>, text?:
   }
 };
 
-// Center of an element's geometry, used as the pivot for rotation
-const getElementCenter = (el: SVGElementData): { x: number; y: number } => {
+// Geometry bounding box in the element's own (untransformed) coordinates
+const getElementBBox = (el: SVGElementData): Box | null => {
   switch (el.type) {
     case 'rect':
-      return { x: (el.x || 0) + (el.width || 0) / 2, y: (el.y || 0) + (el.height || 0) / 2 };
-    case 'circle':
-      return { x: el.cx || 0, y: el.cy || 0 };
-    case 'line':
-      return { x: ((el.x1 || 0) + (el.x2 || 0)) / 2, y: ((el.y1 || 0) + (el.y2 || 0)) / 2 };
+      return { x: el.x || 0, y: el.y || 0, width: el.width || 0, height: el.height || 0 };
+    case 'circle': {
+      const r = el.r || 0;
+      return { x: (el.cx || 0) - r, y: (el.cy || 0) - r, width: r * 2, height: r * 2 };
+    }
+    case 'line': {
+      const x1 = el.x1 || 0, y1 = el.y1 || 0, x2 = el.x2 || 0, y2 = el.y2 || 0;
+      return { x: Math.min(x1, x2), y: Math.min(y1, y2), width: Math.abs(x2 - x1), height: Math.abs(y2 - y1) };
+    }
     case 'polygon': {
       const pts = parsePoints(el.points);
-      if (!pts.length) return { x: 0, y: 0 };
+      if (!pts.length) return null;
       const xs = pts.map(p => p[0]);
       const ys = pts.map(p => p[1]);
-      return { x: (Math.min(...xs) + Math.max(...xs)) / 2, y: (Math.min(...ys) + Math.max(...ys)) / 2 };
+      const minX = Math.min(...xs), minY = Math.min(...ys);
+      return { x: minX, y: minY, width: Math.max(...xs) - minX, height: Math.max(...ys) - minY };
     }
-    case 'path': {
-      const box = measureBBox('path', { d: el.d || '' });
-      return box ? { x: box.x + box.width / 2, y: box.y + box.height / 2 } : { x: 0, y: 0 };
-    }
-    case 'text': {
-      const box = measureBBox(
+    case 'path':
+      return measureBBox('path', { d: el.d || '' });
+    case 'text':
+      return measureBBox(
         'text',
         {
           x: String(el.x ?? 0),
@@ -216,11 +221,16 @@ const getElementCenter = (el: SVGElementData): { x: number; y: number } => {
         },
         el.textContent || ''
       );
-      return box ? { x: box.x + box.width / 2, y: box.y + box.height / 2 } : { x: el.x || 0, y: el.y || 0 };
-    }
     default:
-      return { x: 0, y: 0 };
+      return null;
   }
+};
+
+// Center of an element's geometry, used as the pivot for rotation
+const getElementCenter = (el: SVGElementData): { x: number; y: number } => {
+  const b = getElementBBox(el);
+  if (b) return { x: b.x + b.width / 2, y: b.y + b.height / 2 };
+  return el.type === 'text' ? { x: el.x || 0, y: el.y || 0 } : { x: 0, y: 0 };
 };
 
 // Combined transform: imported transform first, then our rotation about the element's center.
@@ -581,14 +591,49 @@ export default function SVGPaintStudio() {
       applyParsedSettings(parsed.settings);
       setSelectedId(null);
       setCodeError(false);
+      scheduleCommit();
     } catch {
       // Not well-formed yet (mid-typing): keep the last valid canvas and flag it
       setCodeError(true);
     }
   };
 
+  /* ------------------------------ keyboard ------------------------------ */
+
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      const t = e.target as HTMLElement | null;
+      const typing =
+        !!t &&
+        (t.tagName === 'TEXTAREA' ||
+          t.isContentEditable ||
+          (t.tagName === 'INPUT' && !['range', 'color', 'checkbox', 'radio', 'button', 'file'].includes((t as HTMLInputElement).type)));
+      if (typing) return; // let text fields keep their native undo / delete
+
+      const mod = e.ctrlKey || e.metaKey;
+      const key = e.key.toLowerCase();
+      if (mod && key === 'z') {
+        e.preventDefault();
+        if (e.shiftKey) redo();
+        else undo();
+      } else if (mod && key === 'y') {
+        e.preventDefault();
+        redo();
+      } else if ((e.key === 'Delete' || e.key === 'Backspace') && selectedIdRef.current) {
+        e.preventDefault();
+        deleteSelected();
+      } else if (e.key === 'Escape') {
+        setSelectedId(null);
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [undo, redo, deleteSelected]);
+
+  /* ------------------------------- canvas ------------------------------- */
+
   // Map mouse position into SVG user space (respects viewBox, sizing and zoom)
-  const getCanvasCoords = (e: React.MouseEvent<SVGSVGElement>) => {
+  const getCanvasCoords = (e: { clientX: number; clientY: number }) => {
     const svg = svgRef.current;
     const ctm = svg?.getScreenCTM();
     if (!svg || !ctm) return { x: 0, y: 0 };
@@ -668,7 +713,7 @@ export default function SVGPaintStudio() {
         fill: fillColor, fillOpacity,
         stroke: 'transparent', strokeWidth: 0, strokeOpacity: 1
       };
-      updateElementsWithHistory([...elements, newEl]);
+      commitElements([...elementsRef.current, newEl]);
       setSelectedId(newEl.id);
       setIsDrawing(false);
       setActiveTool('select');
@@ -676,22 +721,38 @@ export default function SVGPaintStudio() {
   };
 
   const handleMouseMove = (e: React.MouseEvent<SVGSVGElement>) => {
+    // Moving an existing element
+    const drag = dragRef.current;
+    if (drag) {
+      if (!drag.moved && Math.hypot(e.clientX - drag.startClient.x, e.clientY - drag.startClient.y) < 3) return;
+      drag.moved = true;
+      const c = getCanvasCoords(e);
+      const moved = moveElement(drag.orig, round2(c.x - drag.start.x), round2(c.y - drag.start.y));
+      setElements(elementsRef.current.map(el => (el.id === drag.id ? moved : el)));
+      return;
+    }
+
     if (!isDrawing || !dragStart) return;
+    const draw = drawRef.current;
+    if (draw && !draw.moved && Math.hypot(e.clientX - draw.startClient.x, e.clientY - draw.startClient.y) >= 4) {
+      draw.moved = true;
+    }
     const coords = getCanvasCoords(e);
+    const id = draw?.id;
 
     if (activeTool === 'pencil') {
       setCurrentPoints(prev => [...prev, coords]);
     } else if (activeTool === 'line') {
-      setElements(prev => prev.map(el => el.id === selectedId ? { ...el, x2: coords.x, y2: coords.y } : el));
+      setElements(prev => prev.map(el => el.id === id ? { ...el, x2: coords.x, y2: coords.y } : el));
     } else if (activeTool === 'rect') {
       const x = Math.min(dragStart.x, coords.x);
       const y = Math.min(dragStart.y, coords.y);
       const width = Math.abs(coords.x - dragStart.x);
       const height = Math.abs(coords.y - dragStart.y);
-      setElements(prev => prev.map(el => el.id === selectedId ? { ...el, x, y, width, height } : el));
+      setElements(prev => prev.map(el => el.id === id ? { ...el, x, y, width, height } : el));
     } else if (activeTool === 'circle') {
       const r = round2(Math.sqrt(Math.pow(coords.x - dragStart.x, 2) + Math.pow(coords.y - dragStart.y, 2)));
-      setElements(prev => prev.map(el => el.id === selectedId ? { ...el, r } : el));
+      setElements(prev => prev.map(el => el.id === id ? { ...el, r } : el));
     } else if (activeTool === 'triangle') {
       const x1 = dragStart.x;
       const y1 = dragStart.y;
@@ -1004,14 +1065,15 @@ export default function SVGPaintStudio() {
                   className="relative shadow-2xl transition-transform"
                   style={{ transform: `scale(${zoomLevel})`, transformOrigin: 'center center' }}
                 >
-                  {/* Grid or Plain background */}
+                  {/* Dot grid (inline style so it needs no Tailwind arbitrary-value classes) or plain background */}
                   <div
-                    className={`rounded border border-slate-700 overflow-hidden ${
-                      canvasSettings.showGrid
-                        ? 'bg-[radial-gradient(#334155_1px,transparent_1px)] [background-size:16px_16px]'
-                        : ''
-                    }`}
-                    style={{ backgroundColor: canvasSettings.backgroundColor }}
+                    className="rounded border border-slate-700 overflow-hidden"
+                    style={{
+                      backgroundColor: canvasSettings.backgroundColor,
+                      ...(canvasSettings.showGrid
+                        ? { backgroundImage: 'radial-gradient(#334155 1px, transparent 1px)', backgroundSize: '16px 16px' }
+                        : {})
+                    }}
                   >
                     <svg
                       ref={svgRef}
@@ -1021,7 +1083,8 @@ export default function SVGPaintStudio() {
                       onMouseDown={handleMouseDown}
                       onMouseMove={handleMouseMove}
                       onMouseUp={handleMouseUp}
-                      className="cursor-crosshair block"
+                      onMouseLeave={handleMouseUp}
+                      className={`block ${activeTool === 'select' ? 'cursor-default' : 'cursor-crosshair'}`}
                     >
                       {/* Gradients, patterns etc. carried over from imported SVG */}
                       {canvasSettings.defs && <defs dangerouslySetInnerHTML={{ __html: canvasSettings.defs }} />}
@@ -1041,7 +1104,12 @@ export default function SVGPaintStudio() {
                         const transform = getTransform(el);
 
                         return (
-                          <g key={el.id} onClick={(e) => handleElementClick(e, el.id)}>
+                          <g
+                            key={el.id}
+                            onMouseDown={(e) => handleElementMouseDown(e, el.id)}
+                            onClick={(e) => handleElementClick(e, el.id)}
+                            style={{ cursor: activeTool === 'select' ? 'move' : undefined }}
+                          >
                             {el.type === 'path' && (
                               <path d={el.d} fill={el.fill} fillOpacity={el.fillOpacity} {...strokeAttrs} transform={transform} />
                             )}
