@@ -1,6 +1,6 @@
 // CHQ: drafted by Gemini AI, modified by Claude AI
 
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import {
   MousePointer,
   Pencil,
@@ -302,46 +302,75 @@ const moveElement = (el: SVGElementData, dx: number, dy: number): SVGElementData
   }
 };
 
+// Renders a single element to its one-line SVG markup (shared by elementsToSVG and
+// computeElementLineRanges so the two never drift out of sync with each other).
+const elementToLine = (el: SVGElementData): string => {
+  const fillAttrs = `fill="${esc(paint(el.fill))}" fill-opacity="${el.fillOpacity}"`;
+  const strokeAttrs = [
+    `stroke="${esc(paint(el.stroke))}"`,
+    `stroke-width="${el.strokeWidth}"`,
+    `stroke-opacity="${el.strokeOpacity}"`,
+    el.strokeDasharray ? `stroke-dasharray="${esc(el.strokeDasharray)}"` : '',
+    el.strokeLinecap ? `stroke-linecap="${el.strokeLinecap}"` : '',
+    el.strokeLinejoin ? `stroke-linejoin="${el.strokeLinejoin}"` : ''
+  ].filter(Boolean).join(' ');
+  const tf = getTransform(el);
+  const transformAttr = tf ? ` transform="${esc(tf)}"` : '';
+
+  switch (el.type) {
+    case 'path':
+      return `  <path d="${esc(el.d)}" ${fillAttrs} ${strokeAttrs}${transformAttr} />`;
+    case 'line':
+      return `  <line x1="${el.x1}" y1="${el.y1}" x2="${el.x2}" y2="${el.y2}" ${strokeAttrs}${transformAttr} />`;
+    case 'rect':
+      return `  <rect x="${el.x}" y="${el.y}" width="${el.width}" height="${el.height}" rx="${el.rx || 0}" ${fillAttrs} ${strokeAttrs}${transformAttr} />`;
+    case 'circle':
+      return `  <circle cx="${el.cx}" cy="${el.cy}" r="${el.r}" ${fillAttrs} ${strokeAttrs}${transformAttr} />`;
+    case 'polygon':
+      return `  <polygon points="${esc(el.points)}" ${fillAttrs} ${strokeAttrs}${transformAttr} />`;
+    case 'text': {
+      const textStroke = el.stroke !== 'transparent' && el.strokeWidth > 0 ? ` ${strokeAttrs}` : '';
+      return `  <text x="${el.x}" y="${el.y}" ${fillAttrs}${textStroke} font-size="${el.fontSize}" font-family="${esc(el.fontFamily)}" font-weight="${esc(el.fontWeight)}" font-style="${esc(el.fontStyle)}" text-anchor="${el.textAnchor || 'middle'}"${transformAttr}>${esc(el.textContent)}</text>`;
+    }
+    default:
+      return '';
+  }
+};
+
 // Converts elements array to clean formatted SVG string
 const elementsToSVG = (elements: SVGElementData[], settings: ExportSettings): string => {
-  const innerElements = elements.map(el => {
-    const fillAttrs = `fill="${esc(paint(el.fill))}" fill-opacity="${el.fillOpacity}"`;
-    const strokeAttrs = [
-      `stroke="${esc(paint(el.stroke))}"`,
-      `stroke-width="${el.strokeWidth}"`,
-      `stroke-opacity="${el.strokeOpacity}"`,
-      el.strokeDasharray ? `stroke-dasharray="${esc(el.strokeDasharray)}"` : '',
-      el.strokeLinecap ? `stroke-linecap="${el.strokeLinecap}"` : '',
-      el.strokeLinejoin ? `stroke-linejoin="${el.strokeLinejoin}"` : ''
-    ].filter(Boolean).join(' ');
-    const tf = getTransform(el);
-    const transformAttr = tf ? ` transform="${esc(tf)}"` : '';
-
-    switch (el.type) {
-      case 'path':
-        return `  <path d="${esc(el.d)}" ${fillAttrs} ${strokeAttrs}${transformAttr} />`;
-      case 'line':
-        return `  <line x1="${el.x1}" y1="${el.y1}" x2="${el.x2}" y2="${el.y2}" ${strokeAttrs}${transformAttr} />`;
-      case 'rect':
-        return `  <rect x="${el.x}" y="${el.y}" width="${el.width}" height="${el.height}" rx="${el.rx || 0}" ${fillAttrs} ${strokeAttrs}${transformAttr} />`;
-      case 'circle':
-        return `  <circle cx="${el.cx}" cy="${el.cy}" r="${el.r}" ${fillAttrs} ${strokeAttrs}${transformAttr} />`;
-      case 'polygon':
-        return `  <polygon points="${esc(el.points)}" ${fillAttrs} ${strokeAttrs}${transformAttr} />`;
-      case 'text': {
-        const textStroke = el.stroke !== 'transparent' && el.strokeWidth > 0 ? ` ${strokeAttrs}` : '';
-        return `  <text x="${el.x}" y="${el.y}" ${fillAttrs}${textStroke} font-size="${el.fontSize}" font-family="${esc(el.fontFamily)}" font-weight="${esc(el.fontWeight)}" font-style="${esc(el.fontStyle)}" text-anchor="${el.textAnchor || 'middle'}"${transformAttr}>${esc(el.textContent)}</text>`;
-      }
-      default:
-        return '';
-    }
-  }).filter(Boolean).join('\n');
-
+  const innerElements = elements.map(elementToLine).filter(Boolean).join('\n');
   const defsBlock = settings.defs.trim() ? `  <defs>\n${settings.defs}\n  </defs>\n` : '';
 
   return `<svg width="${settings.width}" height="${settings.height}" viewBox="${esc(settings.viewBox)}" xmlns="${SVG_NS}">
 ${defsBlock}${innerElements}
 </svg>`;
+};
+
+// Maps each element id to the [start, end) character offsets of its line within the
+// string elementsToSVG() would produce for the same elements/settings, so the code
+// editor can highlight the markup for whichever shape is selected on the canvas.
+const computeElementLineRanges = (
+  elements: SVGElementData[],
+  settings: ExportSettings
+): Record<string, { start: number; end: number }> => {
+  const header = `<svg width="${settings.width}" height="${settings.height}" viewBox="${esc(settings.viewBox)}" xmlns="${SVG_NS}">\n`;
+  const defsBlock = settings.defs.trim() ? `  <defs>\n${settings.defs}\n  </defs>\n` : '';
+
+  const ranges: Record<string, { start: number; end: number }> = {};
+  let offset = header.length + defsBlock.length;
+  let wroteLine = false;
+  elements.forEach(el => {
+    const line = elementToLine(el);
+    if (!line) return; // unknown type: elementsToSVG's filter(Boolean) drops it too
+    if (wroteLine) offset += 1; // '\n' joining the previous line to this one
+    const start = offset;
+    const end = start + line.length;
+    ranges[el.id] = { start, end };
+    offset = end;
+    wroteLine = true;
+  });
+  return ranges;
 };
 
 // Presentation properties that cascade from <svg>/<g> down to shapes
@@ -649,6 +678,12 @@ export default function SVGPaintStudio() {
 
   const svgRef = useRef<SVGSVGElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  // Code editor highlight: the scrollable textarea, the transparent overlay <pre> that
+  // paints the highlight behind it, and the highlighted <span> itself (used to measure
+  // where to scroll to).
+  const codeTextareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const codeHighlightRef = useRef<HTMLPreElement | null>(null);
+  const codeHighlightSpanRef = useRef<HTMLSpanElement | null>(null);
   // Set when the change came from typing in the code editor, so the sync effect
   // below doesn't rewrite (and reformat) the text the user is typing.
   const skipCodeSyncRef = useRef<boolean>(false);
@@ -791,6 +826,28 @@ export default function SVGPaintStudio() {
     setSvgCode(elementsToSVG(elements, { width: cw, height: ch, viewBox: cvb, defs: cdefs }));
     setCodeError(false);
   }, [elements, cw, ch, cvb, cdefs]);
+
+  // Character range of each element's line in `svgCode`, kept in step with the same
+  // inputs that regenerate it above.
+  const codeRanges = useMemo(
+    () => computeElementLineRanges(elements, { width: cw, height: ch, viewBox: cvb, defs: cdefs }),
+    [elements, cw, ch, cvb, cdefs]
+  );
+  // While the textarea holds unparsed/invalid text (codeError), those ranges no longer
+  // line up with what's on screen, so don't highlight anything until it's valid again.
+  const codeHighlightRange = selectedId && !codeError ? codeRanges[selectedId] : undefined;
+
+  // Scroll the code editor so the highlighted line for the newly-selected shape is
+  // visible, without moving keyboard focus into the textarea (that would swallow the
+  // Delete/Backspace shortcut handled in the window keydown listener below).
+  useEffect(() => {
+    if (!codeHighlightRange) return;
+    const ta = codeTextareaRef.current;
+    const span = codeHighlightSpanRef.current;
+    if (!ta || !span) return;
+    const target = span.offsetTop - ta.clientHeight / 2 + span.offsetHeight / 2;
+    ta.scrollTop = Math.max(0, Math.min(target, ta.scrollHeight - ta.clientHeight));
+  }, [selectedId, codeHighlightRange, activeViewTab]);
 
   // Clear timers on unmount
   useEffect(() => () => {
@@ -1521,13 +1578,45 @@ export default function SVGPaintStudio() {
                   </div>
                 )}
 
-                <textarea
-                  value={svgCode}
-                  onChange={handleCodeChange}
-                  spellCheck={false}
-                  className="flex-1 bg-slate-950 text-emerald-400 font-mono text-xs p-4 focus:outline-none resize-none leading-relaxed tracking-wide"
-                  placeholder="Paste or edit raw SVG XML code here..."
-                />
+                <div className="flex-1 relative bg-slate-950">
+                  {/* Highlight overlay: mirrors the textarea's text exactly (same font/padding/
+                      wrapping) but paints it transparent, so only the highlighted span's
+                      background shows through behind the real, visible text in the textarea. */}
+                  <pre
+                    ref={codeHighlightRef}
+                    aria-hidden="true"
+                    className="absolute inset-0 m-0 overflow-hidden whitespace-pre-wrap break-words font-mono text-xs p-4 leading-relaxed tracking-wide text-transparent pointer-events-none"
+                  >
+                    {codeHighlightRange ? (
+                      <>
+                        {svgCode.slice(0, codeHighlightRange.start)}
+                        <span ref={codeHighlightSpanRef} className="bg-blue-500/30 rounded-sm">
+                          {svgCode.slice(codeHighlightRange.start, codeHighlightRange.end)}
+                        </span>
+                        {svgCode.slice(codeHighlightRange.end)}
+                      </>
+                    ) : (
+                      svgCode
+                    )}
+                    {'\n'}
+                  </pre>
+
+                  <textarea
+                    ref={codeTextareaRef}
+                    value={svgCode}
+                    onChange={handleCodeChange}
+                    onScroll={(e) => {
+                      const hl = codeHighlightRef.current;
+                      if (hl) {
+                        hl.scrollTop = e.currentTarget.scrollTop;
+                        hl.scrollLeft = e.currentTarget.scrollLeft;
+                      }
+                    }}
+                    spellCheck={false}
+                    className="absolute inset-0 w-full h-full bg-transparent text-emerald-400 font-mono text-xs p-4 focus:outline-none resize-none leading-relaxed tracking-wide whitespace-pre-wrap break-words"
+                    placeholder="Paste or edit raw SVG XML code here..."
+                  />
+                </div>
               </div>
             )}
           </div>
