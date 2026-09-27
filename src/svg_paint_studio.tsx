@@ -31,8 +31,7 @@ import {
   Check,
   Sparkles,
   FileText,
-  RotateCw,
-  Plus
+  RotateCw
 } from 'lucide-react';
 
 // Type definitions for elements, tools, and styles
@@ -75,6 +74,13 @@ interface CanvasSettings {
 
 type ExportSettings = Pick<CanvasSettings, 'width' | 'height' | 'viewBox' | 'defs'>;
 
+// One undo step: everything that ends up in the exported markup
+interface Snapshot extends ExportSettings {
+  elements: SVGElementData[];
+}
+
+type Box = { x: number; y: number; width: number; height: number };
+
 const PRESET_TEMPLATES = [
   {
     name: 'Star Icon',
@@ -104,6 +110,15 @@ const PRESET_TEMPLATES = [
   <text x="200" y="215" fill="#ffffff" font-size="42" font-family="sans-serif" font-weight="bold" text-anchor="middle">SVG ART</text>
 </svg>`
   }
+];
+
+const MAX_HISTORY = 100;
+const FONT_FAMILIES = ['sans-serif', 'serif', 'monospace', 'cursive'];
+const DASH_STYLES = [
+  { label: 'Solid', value: '' },
+  { label: 'Dashed', value: '10 6' },
+  { label: 'Dotted', value: '2 6' },
+  { label: 'Dash-dot', value: '12 4 2 4' }
 ];
 
 /* -------------------------------------------------------------------------- */
@@ -140,6 +155,8 @@ const num = (v: string | null | undefined, fallback: number): number => {
 
 // <input type="color"> only accepts #rrggbb
 const toColorInput = (c: string) => (/^#[0-9a-f]{6}$/i.test(c) ? c : '#000000');
+
+const isBoldWeight = (w?: string) => w === 'bold' || w === 'bolder' || parseInt(w || '', 10) >= 600;
 
 const parsePoints = (points?: string): [number, number][] => {
   const nums = (points || '').trim().split(/[\s,]+/).filter(Boolean).map(Number).filter(Number.isFinite);
@@ -243,6 +260,46 @@ const getTransform = (el: SVGElementData): string | undefined => {
     parts.push(`rotate(${el.rotation} ${round2(c.x)} ${round2(c.y)})`);
   }
   return parts.length ? parts.join(' ') : undefined;
+};
+
+// Add dx/dy to a leading translate(...) if there is one, otherwise prepend a new one.
+// Prepending puts the move in canvas space no matter what transforms the element already carries.
+const TRANSLATE_RE = /^\s*translate\(\s*([-+]?[\d.]+(?:e[-+]?\d+)?)(?:[\s,]+([-+]?[\d.]+(?:e[-+]?\d+)?))?\s*\)\s*(.*)$/i;
+const shiftTransform = (transform: string | undefined, dx: number, dy: number): string => {
+  const m = transform ? TRANSLATE_RE.exec(transform) : null;
+  if (m) {
+    const nx = round2(parseFloat(m[1]) + dx);
+    const ny = round2((m[2] !== undefined ? parseFloat(m[2]) : 0) + dy);
+    return `translate(${nx} ${ny}) ${m[3]}`.trim();
+  }
+  return `translate(${round2(dx)} ${round2(dy)}) ${transform || ''}`.trim();
+};
+
+// Returns a moved copy of an element. Plain shapes get their coordinates edited so the code stays tidy;
+// paths and anything already carrying a transform are moved with a translate() instead.
+const moveElement = (el: SVGElementData, dx: number, dy: number): SVGElementData => {
+  if (el.transform || el.type === 'path') return { ...el, transform: shiftTransform(el.transform, dx, dy) };
+  switch (el.type) {
+    case 'rect':
+      return { ...el, x: round2((el.x || 0) + dx), y: round2((el.y || 0) + dy) };
+    case 'circle':
+      return { ...el, cx: round2((el.cx || 0) + dx), cy: round2((el.cy || 0) + dy) };
+    case 'line':
+      return {
+        ...el,
+        x1: round2((el.x1 || 0) + dx), y1: round2((el.y1 || 0) + dy),
+        x2: round2((el.x2 || 0) + dx), y2: round2((el.y2 || 0) + dy)
+      };
+    case 'text':
+      return { ...el, x: round2((el.x || 0) + dx), y: round2((el.y || 0) + dy) };
+    case 'polygon':
+      return {
+        ...el,
+        points: parsePoints(el.points).map(([x, y]) => `${round2(x + dx)},${round2(y + dy)}`).join(' ')
+      };
+    default:
+      return el;
+  }
 };
 
 // Converts elements array to clean formatted SVG string
@@ -477,30 +534,92 @@ const parseSVGToElements = (svgString: string): { elements: SVGElementData[]; se
 };
 
 /* -------------------------------------------------------------------------- */
+/*  Small presentational pieces                                               */
+/* -------------------------------------------------------------------------- */
+
+// Dashed outline around any element type, drawn in the element's own coordinate space
+// so it rotates and moves with the shape.
+const SelectionOutline = ({ el, transform }: { el: SVGElementData; transform?: string }) => {
+  const b = getElementBBox(el);
+  if (!b) return null;
+  const pad = 4 + (el.strokeWidth || 0) / 2;
+  return (
+    <rect
+      className="pointer-events-none"
+      transform={transform}
+      x={b.x - pad} y={b.y - pad}
+      width={b.width + pad * 2} height={b.height + pad * 2}
+      fill="none" stroke="#3b82f6" strokeWidth="2" strokeDasharray="4 4"
+    />
+  );
+};
+
+// Slider that previews live (onChange) and records ONE undo step when you let go (onCommit)
+const LabeledSlider = ({
+  label, valueLabel, min, max, step = 1, value, onChange, onCommit
+}: {
+  label: React.ReactNode;
+  valueLabel: string;
+  min: number;
+  max: number;
+  step?: number;
+  value: number;
+  onChange: (v: number) => void;
+  onCommit: () => void;
+}) => (
+  <div className="space-y-1">
+    <div className="flex justify-between text-slate-400">
+      <span className="flex items-center gap-1">{label}</span>
+      <span>{valueLabel}</span>
+    </div>
+    <input
+      type="range"
+      min={min}
+      max={max}
+      step={step}
+      value={value}
+      onChange={(e) => onChange(parseFloat(e.target.value))}
+      onPointerUp={onCommit}
+      onKeyUp={onCommit}
+      onBlur={onCommit}
+      className="w-full accent-blue-500"
+    />
+  </div>
+);
+
+/* -------------------------------------------------------------------------- */
 /*  Component                                                                 */
 /* -------------------------------------------------------------------------- */
 
 export default function SVGPaintStudio() {
+  // Parsed once so the canvas, code pane and undo history all start from the same array
+  const [initial] = useState(() => parseSVGToElements(PRESET_TEMPLATES[0].svg));
+
   // Canvas Settings State
-  const [canvasSettings, setCanvasSettings] = useState<CanvasSettings>({
-    width: 600,
-    height: 500,
-    viewBox: '0 0 600 500',
+  const [canvasSettings, setCanvasSettings] = useState<CanvasSettings>(() => ({
+    ...initial.settings,
     backgroundColor: '#ffffff',
-    showGrid: true,
-    defs: ''
-  });
+    showGrid: true
+  }));
 
   // Vector Elements State & History Stack
-  const [elements, setElements] = useState<SVGElementData[]>([]);
-  const [history, setHistory] = useState<SVGElementData[][]>([]);
-  const [historyIndex, setHistoryIndex] = useState<number>(-1);
+  const [elements, setElements] = useState<SVGElementData[]>(initial.elements);
+  const [hist, setHist] = useState<{ stack: Snapshot[]; index: number }>(() => ({
+    stack: [{
+      elements: initial.elements,
+      width: initial.settings.width,
+      height: initial.settings.height,
+      viewBox: initial.settings.viewBox,
+      defs: initial.settings.defs
+    }],
+    index: 0
+  }));
 
   // Active Tool & Style Defaults
   const [activeTool, setActiveTool] = useState<ToolType>('select');
   const [selectedId, setSelectedId] = useState<string | null>(null);
 
-  // Default drawing properties
+  // Default drawing properties (also mirror the selected element while one is selected)
   const [fillColor, setFillColor] = useState<string>('#3b82f6');
   const [fillOpacity, setFillOpacity] = useState<number>(1);
   const [strokeColor, setStrokeColor] = useState<string>('#1d4ed8');
@@ -520,6 +639,7 @@ export default function SVGPaintStudio() {
   const [codeError, setCodeError] = useState<boolean>(false);
   const [codeCopied, setCodeCopied] = useState<boolean>(false);
   const [activeViewTab, setActiveViewTab] = useState<'split' | 'canvas' | 'code'>('split');
+  const [notice, setNotice] = useState<string | null>(null);
 
   // Interactive Drawing & Dragging Internal State
   const [isDrawing, setIsDrawing] = useState<boolean>(false);
@@ -528,21 +648,137 @@ export default function SVGPaintStudio() {
   const [zoomLevel, setZoomLevel] = useState<number>(1);
 
   const svgRef = useRef<SVGSVGElement | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
   // Set when the change came from typing in the code editor, so the sync effect
   // below doesn't rewrite (and reformat) the text the user is typing.
   const skipCodeSyncRef = useRef<boolean>(false);
+  // Moving an existing element with the Select tool
+  const dragRef = useRef<{
+    id: string;
+    orig: SVGElementData;
+    start: { x: number; y: number };
+    startClient: { x: number; y: number };
+    moved: boolean;
+  } | null>(null);
+  // Drawing a new shape: `base` is the array to fall back to if the gesture turns out to be a plain click
+  const drawRef = useRef<{
+    id: string;
+    base: SVGElementData[];
+    startClient: { x: number; y: number };
+    moved: boolean;
+  } | null>(null);
+  const commitTimerRef = useRef<number | null>(null);
+  const noticeTimerRef = useRef<number | null>(null);
 
-  // Record changes to history stack
-  const updateElementsWithHistory = useCallback((newElements: SVGElementData[]) => {
-    setElements(newElements);
-    const newHistory = history.slice(0, historyIndex + 1);
-    setHistory([...newHistory, newElements]);
-    setHistoryIndex(newHistory.length);
-  }, [history, historyIndex]);
+  // Always-fresh mirrors of state, so stable callbacks and window listeners never read stale values
+  const elementsRef = useRef(elements);
+  elementsRef.current = elements;
+  const settingsRef = useRef(canvasSettings);
+  settingsRef.current = canvasSettings;
+  const histRef = useRef(hist);
+  histRef.current = hist;
+  const selectedIdRef = useRef(selectedId);
+  selectedIdRef.current = selectedId;
+
+  /* ------------------------------ history ------------------------------ */
+
+  // History model: `elements` + canvas settings are the live state. Whatever differs from
+  // hist.stack[hist.index] is an uncommitted edit (a slider mid-drag, code mid-typing).
+  // Commits push one snapshot; undo first throws away any uncommitted edit.
+
+  const pushHistory = useCallback((snap: Snapshot) => {
+    setHist(h => {
+      if (sameSnapshot(h.stack[h.index], snap)) return h;
+      const stack = [...h.stack.slice(0, h.index + 1), snap].slice(-MAX_HISTORY);
+      return { stack, index: stack.length - 1 };
+    });
+  }, []);
+
+  const currentSnapshot = useCallback((): Snapshot => {
+    const s = settingsRef.current;
+    return { elements: elementsRef.current, width: s.width, height: s.height, viewBox: s.viewBox, defs: s.defs };
+  }, []);
+
+  const isDirtyNow = useCallback(() => {
+    const h = histRef.current;
+    return !sameSnapshot(h.stack[h.index], currentSnapshot());
+  }, [currentSnapshot]);
+
+  // Record the current state as an undo step (no-op if nothing changed)
+  const commitHistory = useCallback(() => {
+    pushHistory(currentSnapshot());
+  }, [pushHistory, currentSnapshot]);
+
+  // Set new elements and record them in one go (discrete edits: erase, delete, reorder, ...)
+  const commitElements = useCallback((next: SVGElementData[]) => {
+    setElements(next);
+    const s = settingsRef.current;
+    pushHistory({ elements: next, width: s.width, height: s.height, viewBox: s.viewBox, defs: s.defs });
+  }, [pushHistory]);
+
+  const clearPendingCommit = useCallback(() => {
+    if (commitTimerRef.current !== null) {
+      window.clearTimeout(commitTimerRef.current);
+      commitTimerRef.current = null;
+    }
+  }, []);
+
+  // Code typing commits after a short pause rather than per keystroke
+  const scheduleCommit = useCallback(() => {
+    clearPendingCommit();
+    commitTimerRef.current = window.setTimeout(() => {
+      commitTimerRef.current = null;
+      commitHistory();
+    }, 500);
+  }, [clearPendingCommit, commitHistory]);
 
   const applyParsedSettings = useCallback((s: CanvasSettings) => {
     setCanvasSettings(prev => ({ ...prev, width: s.width, height: s.height, viewBox: s.viewBox, defs: s.defs }));
   }, []);
+
+  const restoreSnapshot = useCallback((s: Snapshot) => {
+    setElements(s.elements);
+    applyParsedSettings({ ...settingsRef.current, width: s.width, height: s.height, viewBox: s.viewBox, defs: s.defs });
+  }, [applyParsedSettings]);
+
+  const undo = useCallback(() => {
+    clearPendingCommit();
+    const h = histRef.current;
+    if (isDirtyNow()) {
+      restoreSnapshot(h.stack[h.index]); // discard the uncommitted edit
+      return;
+    }
+    if (h.index > 0) {
+      setHist({ stack: h.stack, index: h.index - 1 });
+      restoreSnapshot(h.stack[h.index - 1]);
+    }
+  }, [clearPendingCommit, isDirtyNow, restoreSnapshot]);
+
+  const redo = useCallback(() => {
+    clearPendingCommit();
+    const h = histRef.current;
+    if (isDirtyNow()) {
+      commitHistory(); // an uncommitted edit means there is nothing to redo
+      return;
+    }
+    if (h.index < h.stack.length - 1) {
+      setHist({ stack: h.stack, index: h.index + 1 });
+      restoreSnapshot(h.stack[h.index + 1]);
+    }
+  }, [clearPendingCommit, isDirtyNow, commitHistory, restoreSnapshot]);
+
+  const liveSnapshot: Snapshot = {
+    elements,
+    width: canvasSettings.width,
+    height: canvasSettings.height,
+    viewBox: canvasSettings.viewBox,
+    defs: canvasSettings.defs
+  };
+  const isDirty = !sameSnapshot(hist.stack[hist.index], liveSnapshot);
+  const canUndo = isDirty || hist.index > 0;
+  const canRedo = !isDirty && hist.index < hist.stack.length - 1;
+
+  /* ------------------------------ syncing ------------------------------ */
 
   // Sync canvas state to SVG code output whenever the drawing changes.
   // Only depends on settings that appear in the markup (not e.g. the grid toggle).
@@ -556,27 +792,106 @@ export default function SVGPaintStudio() {
     setCodeError(false);
   }, [elements, cw, ch, cvb, cdefs]);
 
-  // Initialize with star template on initial load
-  useEffect(() => {
-    const parsed = parseSVGToElements(PRESET_TEMPLATES[0].svg);
-    setElements(parsed.elements);
-    applyParsedSettings(parsed.settings);
-    setHistory([parsed.elements]);
-    setHistoryIndex(0);
-  }, [applyParsedSettings]);
+  // Clear timers on unmount
+  useEffect(() => () => {
+    if (commitTimerRef.current !== null) window.clearTimeout(commitTimerRef.current);
+    if (noticeTimerRef.current !== null) window.clearTimeout(noticeTimerRef.current);
+  }, []);
 
-  // Undo / Redo
-  const handleUndo = () => {
-    if (historyIndex > 0) {
-      setHistoryIndex(historyIndex - 1);
-      setElements(history[historyIndex - 1]);
+  /* --------------------------- element helpers --------------------------- */
+
+  // Select an element and load its style into the side-panel controls
+  const selectElement = useCallback((id: string) => {
+    setSelectedId(id);
+    const el = elementsRef.current.find(e => e.id === id);
+    if (!el) return;
+    setFillColor(el.fill);
+    setStrokeColor(el.stroke);
+    setStrokeWidth(el.strokeWidth);
+    setFillOpacity(el.fillOpacity);
+    setStrokeOpacity(el.strokeOpacity);
+    setStrokeDash(el.strokeDasharray || '');
+    if (el.type === 'rect' && el.rx !== undefined) setCornerRadius(el.rx);
+    if (el.type === 'text') {
+      setFontSize(el.fontSize ?? 28);
+      setFontFamily(el.fontFamily || 'sans-serif');
+      setIsBold(isBoldWeight(el.fontWeight));
+      setIsItalic(el.fontStyle === 'italic');
     }
+  }, []);
+
+  // Property updates for the selected shape. Continuous controls call this without `commit`
+  // (live preview) and commit on release; discrete controls pass commit = true.
+  const updateSelectedElement = <K extends keyof SVGElementData>(key: K, value: SVGElementData[K], commit = false) => {
+    const id = selectedIdRef.current;
+    if (!id || !elementsRef.current.some(el => el.id === id)) return;
+    const next = elementsRef.current.map(el => (el.id === id ? ({ ...el, [key]: value } as SVGElementData) : el));
+    if (commit) commitElements(next);
+    else setElements(next);
   };
 
-  const handleRedo = () => {
-    if (historyIndex < history.length - 1) {
-      setHistoryIndex(historyIndex + 1);
-      setElements(history[historyIndex + 1]);
+  const deleteSelected = useCallback(() => {
+    const id = selectedIdRef.current;
+    if (!id) return;
+    commitElements(elementsRef.current.filter(el => el.id !== id));
+    setSelectedId(null);
+  }, [commitElements]);
+
+  // Layer order operations
+  const moveLayer = (direction: 'up' | 'down' | 'top' | 'bottom') => {
+    if (!selectedId) return;
+    const idx = elements.findIndex(el => el.id === selectedId);
+    if (idx === -1) return;
+
+    const newArr = [...elements];
+    const [item] = newArr.splice(idx, 1);
+
+    if (direction === 'up' && idx < elements.length - 1) newArr.splice(idx + 1, 0, item);
+    else if (direction === 'down' && idx > 0) newArr.splice(idx - 1, 0, item);
+    else if (direction === 'top') newArr.push(item);
+    else if (direction === 'bottom') newArr.unshift(item);
+
+    commitElements(newArr);
+  };
+
+  /* --------------------------- loading / import --------------------------- */
+
+  const flashNotice = (msg: string) => {
+    setNotice(msg);
+    if (noticeTimerRef.current !== null) window.clearTimeout(noticeTimerRef.current);
+    noticeTimerRef.current = window.setTimeout(() => setNotice(null), 4000);
+  };
+
+  // Replace the whole drawing (preset or imported file) as a single undoable step
+  const loadSvgString = (svg: string) => {
+    const parsed = parseSVGToElements(svg);
+    clearPendingCommit();
+    setElements(parsed.elements);
+    applyParsedSettings(parsed.settings);
+    setSelectedId(null);
+    pushHistory({
+      elements: parsed.elements,
+      width: parsed.settings.width,
+      height: parsed.settings.height,
+      viewBox: parsed.settings.viewBox,
+      defs: parsed.settings.defs
+    });
+  };
+
+  const handleImportFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = ''; // allow importing the same file again
+    if (!file) return;
+    try {
+      const text = await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result));
+        reader.onerror = () => reject(reader.error);
+        reader.readAsText(file);
+      });
+      loadSvgString(text);
+    } catch {
+      flashNotice('Could not import: that file is not valid SVG.');
     }
   };
 
@@ -644,11 +959,33 @@ export default function SVGPaintStudio() {
     return { x: round2(p.x), y: round2(p.y) };
   };
 
+  // Start moving an element (Select tool). Clicking a shape selects it; dragging moves it.
+  const handleElementMouseDown = (e: React.MouseEvent, id: string) => {
+    if (activeTool !== 'select' || e.button !== 0) return;
+    e.stopPropagation();
+    commitHistory(); // close any uncommitted slider / code edit first
+    selectElement(id);
+    const orig = elementsRef.current.find(el => el.id === id);
+    if (!orig) return;
+    dragRef.current = {
+      id,
+      orig,
+      start: getCanvasCoords(e),
+      startClient: { x: e.clientX, y: e.clientY },
+      moved: false
+    };
+  };
+
   const handleMouseDown = (e: React.MouseEvent<SVGSVGElement>) => {
+    if (e.button !== 0) return;
+    commitHistory();
     const coords = getCanvasCoords(e);
     setDragStart(coords);
 
-    if (activeTool === 'select') return;
+    if (activeTool === 'select') {
+      setSelectedId(null); // click on empty canvas deselects
+      return;
+    }
 
     if (activeTool === 'eraser') {
       return; // Eraser handles directly on element click
@@ -656,49 +993,52 @@ export default function SVGPaintStudio() {
 
     setIsDrawing(true);
 
+    const startShape = (newEl: SVGElementData) => {
+      drawRef.current = {
+        id: newEl.id,
+        base: elementsRef.current,
+        startClient: { x: e.clientX, y: e.clientY },
+        moved: false
+      };
+      setElements(prev => [...prev, newEl]);
+      setSelectedId(newEl.id);
+    };
+
     if (activeTool === 'pencil') {
       setCurrentPoints([coords]);
     } else if (activeTool === 'line') {
-      const newEl: SVGElementData = {
+      startShape({
         id: `line-${Date.now()}`,
         type: 'line',
         x1: coords.x, y1: coords.y, x2: coords.x, y2: coords.y,
         fill: 'transparent', fillOpacity: 1,
         stroke: strokeColor, strokeWidth, strokeOpacity, strokeDasharray: strokeDash
-      };
-      setElements(prev => [...prev, newEl]);
-      setSelectedId(newEl.id);
+      });
     } else if (activeTool === 'rect') {
-      const newEl: SVGElementData = {
+      startShape({
         id: `rect-${Date.now()}`,
         type: 'rect',
         x: coords.x, y: coords.y, width: 1, height: 1, rx: cornerRadius,
         fill: fillColor, fillOpacity,
         stroke: strokeColor, strokeWidth, strokeOpacity, strokeDasharray: strokeDash
-      };
-      setElements(prev => [...prev, newEl]);
-      setSelectedId(newEl.id);
+      });
     } else if (activeTool === 'circle') {
-      const newEl: SVGElementData = {
+      startShape({
         id: `circle-${Date.now()}`,
         type: 'circle',
         cx: coords.x, cy: coords.y, r: 1,
         fill: fillColor, fillOpacity,
         stroke: strokeColor, strokeWidth, strokeOpacity, strokeDasharray: strokeDash
-      };
-      setElements(prev => [...prev, newEl]);
-      setSelectedId(newEl.id);
+      });
     } else if (activeTool === 'triangle') {
       const points = `${coords.x},${coords.y} ${coords.x},${coords.y} ${coords.x},${coords.y}`;
-      const newEl: SVGElementData = {
+      startShape({
         id: `triangle-${Date.now()}`,
         type: 'polygon',
         points,
         fill: fillColor, fillOpacity,
         stroke: strokeColor, strokeWidth, strokeOpacity, strokeDasharray: strokeDash
-      };
-      setElements(prev => [...prev, newEl]);
-      setSelectedId(newEl.id);
+      });
     } else if (activeTool === 'text') {
       const textVal = prompt('Enter text for SVG shape:', 'Hello SVG') || 'Hello SVG';
       const newEl: SVGElementData = {
@@ -760,79 +1100,56 @@ export default function SVGPaintStudio() {
       const y2 = coords.y;
       const x3 = round2(x1 - (x2 - x1));
       const points = `${x1},${y1} ${x2},${y2} ${x3},${y2}`;
-      setElements(prev => prev.map(el => el.id === selectedId ? { ...el, points } : el));
+      setElements(prev => prev.map(el => el.id === id ? { ...el, points } : el));
     }
   };
 
   const handleMouseUp = () => {
+    // Finish moving an element: one undo step for the whole drag
+    const drag = dragRef.current;
+    if (drag) {
+      dragRef.current = null;
+      if (drag.moved) commitHistory();
+      return;
+    }
+
     if (!isDrawing) return;
     setIsDrawing(false);
+    const draw = drawRef.current;
+    drawRef.current = null;
 
-    if (activeTool === 'pencil' && currentPoints.length > 1) {
-      const d = currentPoints.reduce((acc, pt, idx) => `${acc} ${idx === 0 ? 'M' : 'L'} ${pt.x} ${pt.y}`, '');
-      const newEl: SVGElementData = {
-        id: `path-${Date.now()}`,
-        type: 'path',
-        d,
-        fill: 'transparent', fillOpacity: 1,
-        stroke: strokeColor, strokeWidth, strokeOpacity, strokeDasharray: strokeDash
-      };
-      updateElementsWithHistory([...elements, newEl]);
-      setSelectedId(newEl.id);
-      setCurrentPoints([]);
-    } else {
-      updateElementsWithHistory(elements);
-    }
-  };
-
-  // Element interaction handlers
-  const handleElementClick = (e: React.MouseEvent, id: string) => {
-    e.stopPropagation();
-    if (activeTool === 'eraser') {
-      const filtered = elements.filter(el => el.id !== id);
-      updateElementsWithHistory(filtered);
-      if (selectedId === id) setSelectedId(null);
-    } else if (activeTool === 'select') {
-      setSelectedId(id);
-      // Populate inspector controls with selected element attributes
-      const selected = elements.find(el => el.id === id);
-      if (selected) {
-        setFillColor(selected.fill);
-        setStrokeColor(selected.stroke);
-        setStrokeWidth(selected.strokeWidth);
-        if (selected.type === 'rect' && selected.rx !== undefined) setCornerRadius(selected.rx);
+    if (activeTool === 'pencil') {
+      if (currentPoints.length > 1) {
+        const d = currentPoints.reduce((acc, pt, idx) => `${acc} ${idx === 0 ? 'M' : 'L'} ${pt.x} ${pt.y}`, '');
+        const newEl: SVGElementData = {
+          id: `path-${Date.now()}`,
+          type: 'path',
+          d,
+          fill: 'transparent', fillOpacity: 1,
+          stroke: strokeColor, strokeWidth, strokeOpacity, strokeDasharray: strokeDash
+        };
+        commitElements([...elementsRef.current, newEl]);
+        setSelectedId(newEl.id);
       }
+      setCurrentPoints([]);
+      return;
     }
+
+    // Shape tools: a plain click (no real drag) creates nothing
+    if (draw && !draw.moved) {
+      setElements(draw.base);
+      setSelectedId(null);
+      return;
+    }
+    commitHistory();
   };
 
-  // Property updates for selected shape
-  const updateSelectedElement = (key: keyof SVGElementData, value: unknown) => {
-    if (!selectedId) return;
-    const updated = elements.map(el => el.id === selectedId ? { ...el, [key]: value } : el);
-    updateElementsWithHistory(updated);
-  };
-
-  // Layer order operations
-  const moveLayer = (direction: 'up' | 'down' | 'top' | 'bottom') => {
-    if (!selectedId) return;
-    const idx = elements.findIndex(el => el.id === selectedId);
-    if (idx === -1) return;
-
-    const newArr = [...elements];
-    const [item] = newArr.splice(idx, 1);
-
-    if (direction === 'up' && idx < elements.length - 1) newArr.splice(idx + 1, 0, item);
-    else if (direction === 'down' && idx > 0) newArr.splice(idx - 1, 0, item);
-    else if (direction === 'top') newArr.push(item);
-    else if (direction === 'bottom') newArr.unshift(item);
-
-    updateElementsWithHistory(newArr);
-  };
-
-  const deleteSelected = () => {
-    if (!selectedId) return;
-    updateElementsWithHistory(elements.filter(el => el.id !== selectedId));
-    setSelectedId(null);
+  // Eraser: click a shape to delete it
+  const handleElementClick = (e: React.MouseEvent, id: string) => {
+    if (activeTool !== 'eraser') return;
+    e.stopPropagation();
+    commitElements(elementsRef.current.filter(el => el.id !== id));
+    if (selectedId === id) setSelectedId(null);
   };
 
   // Copy code feedback
@@ -875,6 +1192,12 @@ export default function SVGPaintStudio() {
   };
 
   const selectedElement = elements.find(el => el.id === selectedId);
+  const isTextSelected = selectedElement?.type === 'text';
+  const showTextPanel = activeTool === 'text' || isTextSelected;
+  const dashOptions = DASH_STYLES.some(d => d.value === strokeDash)
+    ? DASH_STYLES
+    : [...DASH_STYLES, { label: `Custom (${strokeDash})`, value: strokeDash }];
+  const fontOptions = FONT_FAMILIES.includes(fontFamily) ? FONT_FAMILIES : [fontFamily, ...FONT_FAMILIES];
 
   return (
     <div className="flex flex-col h-screen w-screen bg-slate-900 text-slate-100 font-sans overflow-hidden">
@@ -896,21 +1219,16 @@ export default function SVGPaintStudio() {
 
         {/* Action Controls & Templates */}
         <div className="flex items-center gap-2">
-          {/* Preset Template Selector */}
+          {notice && <span className="text-xs text-rose-300 mr-1">{notice}</span>}
+
+          {/* Preset Template Selector (controlled, so the same preset can be loaded again) */}
           <select
+            value=""
             onChange={(e) => {
               const idx = parseInt(e.target.value, 10);
-              if (!isNaN(idx)) {
-                const parsed = parseSVGToElements(PRESET_TEMPLATES[idx].svg);
-                setElements(parsed.elements);
-                applyParsedSettings(parsed.settings);
-                setSelectedId(null);
-                setHistory([parsed.elements]);
-                setHistoryIndex(0);
-              }
+              if (!isNaN(idx)) loadSvgString(PRESET_TEMPLATES[idx].svg);
             }}
             className="bg-slate-700 text-xs text-slate-200 border border-slate-600 rounded px-2 py-1.5 focus:outline-none focus:border-blue-500"
-            defaultValue=""
           >
             <option value="" disabled>Load Preset Template...</option>
             {PRESET_TEMPLATES.map((tmpl, index) => (
@@ -918,20 +1236,36 @@ export default function SVGPaintStudio() {
             ))}
           </select>
 
+          {/* Import an .svg file */}
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept=".svg,image/svg+xml"
+            className="hidden"
+            onChange={handleImportFile}
+          />
+          <button
+            onClick={() => fileInputRef.current?.click()}
+            className="flex items-center gap-1.5 px-3 py-1.5 text-xs bg-slate-700 hover:bg-slate-600 text-slate-200 rounded font-medium transition"
+            title="Import an SVG file"
+          >
+            <Upload className="w-3.5 h-3.5" /> Import
+          </button>
+
           {/* Undo / Redo */}
           <button
-            onClick={handleUndo}
-            disabled={historyIndex <= 0}
+            onClick={undo}
+            disabled={!canUndo}
             className="p-1.5 text-slate-300 hover:text-white bg-slate-700/50 hover:bg-slate-700 disabled:opacity-40 rounded transition"
-            title="Undo"
+            title="Undo (Ctrl+Z)"
           >
             <Undo className="w-4 h-4" />
           </button>
           <button
-            onClick={handleRedo}
-            disabled={historyIndex >= history.length - 1}
+            onClick={redo}
+            disabled={!canRedo}
             className="p-1.5 text-slate-300 hover:text-white bg-slate-700/50 hover:bg-slate-700 disabled:opacity-40 rounded transition"
-            title="Redo"
+            title="Redo (Ctrl+Shift+Z)"
           >
             <Redo className="w-4 h-4" />
           </button>
@@ -1137,24 +1471,8 @@ export default function SVGPaintStudio() {
                               </text>
                             )}
 
-                            {/* Render Active Selection Bounding Box (follows the element's transform) */}
-                            {isSelected && (
-                              <g className="pointer-events-none" transform={transform}>
-                                {el.type === 'rect' && (
-                                  <rect
-                                    x={(el.x || 0) - 4} y={(el.y || 0) - 4}
-                                    width={(el.width || 0) + 8} height={(el.height || 0) + 8}
-                                    fill="none" stroke="#3b82f6" strokeWidth="2" strokeDasharray="4 4"
-                                  />
-                                )}
-                                {el.type === 'circle' && (
-                                  <circle
-                                    cx={el.cx} cy={el.cy} r={(el.r || 0) + 4}
-                                    fill="none" stroke="#3b82f6" strokeWidth="2" strokeDasharray="4 4"
-                                  />
-                                )}
-                              </g>
-                            )}
+                            {/* Selection outline for every element type (follows the element's transform) */}
+                            {isSelected && <SelectionOutline el={el} transform={transform} />}
                           </g>
                         );
                       })}
@@ -1167,6 +1485,7 @@ export default function SVGPaintStudio() {
                           stroke={strokeColor}
                           strokeWidth={strokeWidth}
                           strokeOpacity={strokeOpacity}
+                          strokeDasharray={strokeDash || undefined}
                         />
                       )}
                     </svg>
@@ -1197,7 +1516,7 @@ export default function SVGPaintStudio() {
                 </div>
 
                 {codeError && (
-                  <div className="px-3 py-1.5 text-[11px] text-amber-300 bg-amber-500/10 border-b border-amber-500/30">
+                  <div className="px-3 py-1.5 text-xs text-amber-300 bg-amber-500/10 border-b border-amber-500/30">
                     Invalid SVG markup. The canvas is showing the last valid version.
                   </div>
                 )}
@@ -1231,6 +1550,7 @@ export default function SVGPaintStudio() {
                     const w = parseInt(e.target.value, 10) || 100;
                     setCanvasSettings(s => ({ ...s, width: w, viewBox: `0 0 ${w} ${s.height}` }));
                   }}
+                  onBlur={commitHistory}
                   className="w-full bg-slate-900 border border-slate-700 rounded px-2 py-1 text-slate-200 focus:outline-none focus:border-blue-500"
                 />
               </div>
@@ -1243,6 +1563,7 @@ export default function SVGPaintStudio() {
                     const h = parseInt(e.target.value, 10) || 100;
                     setCanvasSettings(s => ({ ...s, height: h, viewBox: `0 0 ${s.width} ${h}` }));
                   }}
+                  onBlur={commitHistory}
                   className="w-full bg-slate-900 border border-slate-700 rounded px-2 py-1 text-slate-200 focus:outline-none focus:border-blue-500"
                 />
               </div>
@@ -1262,9 +1583,10 @@ export default function SVGPaintStudio() {
                 <button
                   onClick={() => {
                     setFillColor('transparent');
-                    if (selectedId) updateSelectedElement('fill', 'transparent');
+                    updateSelectedElement('fill', 'transparent', true);
                   }}
-                  className="text-blue-400 hover:underline text-[10px]"
+                  className="text-blue-400 hover:underline"
+                  style={{ fontSize: 10 }}
                 >
                   Set Transparent
                 </button>
@@ -1275,8 +1597,9 @@ export default function SVGPaintStudio() {
                   value={toColorInput(fillColor)}
                   onChange={(e) => {
                     setFillColor(e.target.value);
-                    if (selectedId) updateSelectedElement('fill', e.target.value);
+                    updateSelectedElement('fill', e.target.value);
                   }}
+                  onBlur={commitHistory}
                   className="w-8 h-8 rounded bg-transparent cursor-pointer border border-slate-700"
                 />
                 <input
@@ -1284,12 +1607,25 @@ export default function SVGPaintStudio() {
                   value={fillColor}
                   onChange={(e) => {
                     setFillColor(e.target.value);
-                    if (selectedId) updateSelectedElement('fill', e.target.value);
+                    updateSelectedElement('fill', e.target.value);
                   }}
+                  onBlur={commitHistory}
                   className="flex-1 bg-slate-900 border border-slate-700 rounded px-2 text-slate-200 focus:outline-none focus:border-blue-500 font-mono"
                 />
               </div>
             </div>
+
+            <LabeledSlider
+              label="Fill Opacity"
+              valueLabel={`${Math.round(fillOpacity * 100)}%`}
+              min={0} max={1} step={0.05}
+              value={fillOpacity}
+              onChange={(v) => {
+                setFillOpacity(v);
+                updateSelectedElement('fillOpacity', v);
+              }}
+              onCommit={commitHistory}
+            />
 
             {/* Stroke Color */}
             <div className="space-y-1">
@@ -1300,8 +1636,9 @@ export default function SVGPaintStudio() {
                   value={toColorInput(strokeColor)}
                   onChange={(e) => {
                     setStrokeColor(e.target.value);
-                    if (selectedId) updateSelectedElement('stroke', e.target.value);
+                    updateSelectedElement('stroke', e.target.value);
                   }}
+                  onBlur={commitHistory}
                   className="w-8 h-8 rounded bg-transparent cursor-pointer border border-slate-700"
                 />
                 <input
@@ -1309,53 +1646,140 @@ export default function SVGPaintStudio() {
                   value={strokeColor}
                   onChange={(e) => {
                     setStrokeColor(e.target.value);
-                    if (selectedId) updateSelectedElement('stroke', e.target.value);
+                    updateSelectedElement('stroke', e.target.value);
                   }}
+                  onBlur={commitHistory}
                   className="flex-1 bg-slate-900 border border-slate-700 rounded px-2 text-slate-200 focus:outline-none focus:border-blue-500 font-mono"
                 />
               </div>
             </div>
 
-            {/* Stroke Width Slider */}
+            <LabeledSlider
+              label="Stroke Width"
+              valueLabel={`${strokeWidth}px`}
+              min={0} max={30}
+              value={strokeWidth}
+              onChange={(v) => {
+                setStrokeWidth(v);
+                updateSelectedElement('strokeWidth', v);
+              }}
+              onCommit={commitHistory}
+            />
+
+            <LabeledSlider
+              label="Stroke Opacity"
+              valueLabel={`${Math.round(strokeOpacity * 100)}%`}
+              min={0} max={1} step={0.05}
+              value={strokeOpacity}
+              onChange={(v) => {
+                setStrokeOpacity(v);
+                updateSelectedElement('strokeOpacity', v);
+              }}
+              onCommit={commitHistory}
+            />
+
+            {/* Stroke style */}
             <div className="space-y-1">
-              <div className="flex justify-between text-slate-400">
-                <span>Stroke Width</span>
-                <span>{strokeWidth}px</span>
-              </div>
-              <input
-                type="range"
-                min="0"
-                max="30"
-                value={strokeWidth}
+              <label className="text-slate-400 block">Stroke Style</label>
+              <select
+                value={strokeDash}
                 onChange={(e) => {
-                  const val = parseInt(e.target.value, 10);
-                  setStrokeWidth(val);
-                  if (selectedId) updateSelectedElement('strokeWidth', val);
+                  setStrokeDash(e.target.value);
+                  updateSelectedElement('strokeDasharray', e.target.value, true);
                 }}
-                className="w-full accent-blue-500"
-              />
+                className="w-full bg-slate-900 border border-slate-700 rounded px-2 py-1 text-slate-200 focus:outline-none focus:border-blue-500"
+              >
+                {dashOptions.map((opt) => (
+                  <option key={opt.value} value={opt.value}>{opt.label}</option>
+                ))}
+              </select>
             </div>
 
             {/* Corner Radius for Rectangles */}
-            <div className="space-y-1">
-              <div className="flex justify-between text-slate-400">
-                <span>Corner Radius (rx)</span>
-                <span>{cornerRadius}px</span>
-              </div>
-              <input
-                type="range"
-                min="0"
-                max="50"
-                value={cornerRadius}
-                onChange={(e) => {
-                  const val = parseInt(e.target.value, 10);
-                  setCornerRadius(val);
-                  if (selectedId) updateSelectedElement('rx', val);
-                }}
-                className="w-full accent-blue-500"
-              />
-            </div>
+            <LabeledSlider
+              label="Corner Radius (rx)"
+              valueLabel={`${cornerRadius}px`}
+              min={0} max={50}
+              value={cornerRadius}
+              onChange={(v) => {
+                setCornerRadius(v);
+                updateSelectedElement('rx', v);
+              }}
+              onCommit={commitHistory}
+            />
           </div>
+
+          {/* TEXT OPTIONS (Text tool active, or a text element selected) */}
+          {showTextPanel && (
+            <div className="p-4 border-b border-slate-700 space-y-3">
+              <h3 className="font-semibold text-slate-200 text-xs tracking-wider uppercase flex items-center gap-1.5">
+                <TypeIcon className="w-3.5 h-3.5 text-blue-400" /> Text
+              </h3>
+
+              <div className="space-y-1">
+                <label className="text-slate-400 block">Font</label>
+                <select
+                  value={fontFamily}
+                  onChange={(e) => {
+                    setFontFamily(e.target.value);
+                    if (isTextSelected) updateSelectedElement('fontFamily', e.target.value, true);
+                  }}
+                  className="w-full bg-slate-900 border border-slate-700 rounded px-2 py-1 text-slate-200 focus:outline-none focus:border-blue-500"
+                >
+                  {fontOptions.map((f) => (
+                    <option key={f} value={f}>{f}</option>
+                  ))}
+                </select>
+              </div>
+
+              <LabeledSlider
+                label="Font Size"
+                valueLabel={`${fontSize}px`}
+                min={8} max={200}
+                value={fontSize}
+                onChange={(v) => {
+                  setFontSize(v);
+                  if (isTextSelected) updateSelectedElement('fontSize', v);
+                }}
+                onCommit={commitHistory}
+              />
+
+              <div className="flex gap-2">
+                <button
+                  aria-pressed={isBold}
+                  onClick={() => {
+                    const v = !isBold;
+                    setIsBold(v);
+                    if (isTextSelected) updateSelectedElement('fontWeight', v ? 'bold' : 'normal', true);
+                  }}
+                  className={`w-9 h-8 rounded border font-bold transition ${
+                    isBold
+                      ? 'bg-blue-600 border-blue-500 text-white'
+                      : 'bg-slate-700 border-slate-600 text-slate-300 hover:bg-slate-600'
+                  }`}
+                  title="Bold"
+                >
+                  B
+                </button>
+                <button
+                  aria-pressed={isItalic}
+                  onClick={() => {
+                    const v = !isItalic;
+                    setIsItalic(v);
+                    if (isTextSelected) updateSelectedElement('fontStyle', v ? 'italic' : 'normal', true);
+                  }}
+                  className={`w-9 h-8 rounded border italic transition ${
+                    isItalic
+                      ? 'bg-blue-600 border-blue-500 text-white'
+                      : 'bg-slate-700 border-slate-600 text-slate-300 hover:bg-slate-600'
+                  }`}
+                  title="Italic"
+                >
+                  I
+                </button>
+              </div>
+            </div>
+          )}
 
           {/* ELEMENT INSPECTOR */}
           {selectedElement && (
@@ -1367,27 +1791,21 @@ export default function SVGPaintStudio() {
                 <button
                   onClick={deleteSelected}
                   className="text-rose-400 hover:text-rose-300 p-1 hover:bg-slate-700 rounded"
-                  title="Delete Shape"
+                  title="Delete Shape (Del)"
                 >
                   <Trash2 className="w-4 h-4" />
                 </button>
               </div>
 
               {/* Rotation Handle */}
-              <div className="space-y-1">
-                <div className="flex justify-between text-slate-400">
-                  <span className="flex items-center gap-1"><RotateCw className="w-3 h-3" /> Rotation</span>
-                  <span>{selectedElement.rotation || 0}°</span>
-                </div>
-                <input
-                  type="range"
-                  min="0"
-                  max="360"
-                  value={selectedElement.rotation || 0}
-                  onChange={(e) => updateSelectedElement('rotation', parseInt(e.target.value, 10))}
-                  className="w-full accent-blue-500"
-                />
-              </div>
+              <LabeledSlider
+                label={<><RotateCw className="w-3 h-3" /> Rotation</>}
+                valueLabel={`${selectedElement.rotation || 0}°`}
+                min={0} max={360}
+                value={selectedElement.rotation || 0}
+                onChange={(v) => updateSelectedElement('rotation', v)}
+                onCommit={commitHistory}
+              />
 
               {/* Text specific settings */}
               {selectedElement.type === 'text' && (
@@ -1397,6 +1815,7 @@ export default function SVGPaintStudio() {
                     type="text"
                     value={selectedElement.textContent || ''}
                     onChange={(e) => updateSelectedElement('textContent', e.target.value)}
+                    onBlur={commitHistory}
                     className="w-full bg-slate-900 border border-slate-700 rounded px-2 py-1 text-slate-200 focus:outline-none focus:border-blue-500"
                   />
                 </div>
@@ -1458,7 +1877,7 @@ export default function SVGPaintStudio() {
                   return (
                     <div
                       key={el.id}
-                      onClick={() => setSelectedId(el.id)}
+                      onClick={() => selectElement(el.id)}
                       className={`px-3 py-2 flex items-center justify-between cursor-pointer transition ${
                         isSelected ? 'bg-blue-600/20 text-blue-300 font-medium' : 'text-slate-400 hover:bg-slate-800/60'
                       }`}
@@ -1467,7 +1886,7 @@ export default function SVGPaintStudio() {
                         <FileText className="w-3.5 h-3.5 opacity-60" />
                         {el.type}
                       </span>
-                      <span className="text-[10px] text-slate-500 font-mono">
+                      <span className="text-slate-500 font-mono" style={{ fontSize: 10 }}>
                         {el.id.split('-')[2] || ''}
                       </span>
                     </div>
