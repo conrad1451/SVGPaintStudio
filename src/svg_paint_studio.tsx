@@ -302,6 +302,201 @@ const moveElement = (el: SVGElementData, dx: number, dy: number): SVGElementData
   }
 };
 
+/* ---------------------------- resize helpers ---------------------------- */
+
+// Scale mapping applied in an element's own (pre-transform) coordinate space:
+// p' = anchor + scale * (p - anchor) + shift. Relative path offsets only get the scale.
+type ScaleMap = { ax: number; ay: number; sx: number; sy: number; dx: number; dy: number };
+
+const mapX = (m: ScaleMap, x: number) => round2(m.ax + m.sx * (x - m.ax) + m.dx);
+const mapY = (m: ScaleMap, y: number) => round2(m.ay + m.sy * (y - m.ay) + m.dy);
+
+const PATH_PARAMS: Record<string, number> = { m: 2, l: 2, h: 1, v: 1, c: 6, s: 4, q: 4, t: 2, a: 7, z: 0 };
+const PATH_NUM_RE = /^[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?/;
+
+// Rewrites path data under a ScaleMap. Handles every command, relative or absolute, plus the
+// compact arc-flag syntax ("a1 1 0 00.5.5"). Returns null if the data can't be parsed.
+const scalePathData = (d: string, m: ScaleMap): string | null => {
+  const out: string[] = [];
+  let i = 0;
+  let cmd = '';
+  let fresh = false; // true until the first parameter group after a command letter is written
+  const skipSep = () => { while (i < d.length && /[\s,]/.test(d[i])) i++; };
+  const readNum = (): number | null => {
+    skipSep();
+    const hit = PATH_NUM_RE.exec(d.slice(i));
+    if (!hit) return null;
+    i += hit[0].length;
+    return parseFloat(hit[0]);
+  };
+  const readFlag = (): number | null => {
+    skipSep();
+    if (d[i] !== '0' && d[i] !== '1') return null;
+    return parseInt(d[i++], 10);
+  };
+
+  skipSep();
+  while (i < d.length) {
+    const ch = d[i];
+    if (/[a-zA-Z]/.test(ch)) {
+      if (!(ch.toLowerCase() in PATH_PARAMS)) return null;
+      cmd = ch;
+      fresh = true;
+      i++;
+      if (cmd === 'z' || cmd === 'Z') out.push('Z');
+      skipSep();
+      if (cmd.toLowerCase() === 'z') continue;
+    } else if (!cmd || cmd.toLowerCase() === 'z') {
+      return null; // numbers with no command to own them
+    }
+
+    const lower = cmd.toLowerCase();
+    const abs = cmd === cmd.toUpperCase();
+    const nums: number[] = [];
+    for (let k = 0; k < PATH_PARAMS[lower]; k++) {
+      const v = lower === 'a' && (k === 3 || k === 4) ? readFlag() : readNum();
+      if (v === null) return null;
+      nums.push(v);
+    }
+
+    let mapped: number[];
+    if (lower === 'h') mapped = [abs ? mapX(m, nums[0]) : round2(nums[0] * m.sx)];
+    else if (lower === 'v') mapped = [abs ? mapY(m, nums[0]) : round2(nums[0] * m.sy)];
+    else if (lower === 'a') {
+      mapped = [
+        round2(nums[0] * m.sx), round2(nums[1] * m.sy), nums[2], nums[3], nums[4],
+        abs ? mapX(m, nums[5]) : round2(nums[5] * m.sx),
+        abs ? mapY(m, nums[6]) : round2(nums[6] * m.sy)
+      ];
+    } else {
+      mapped = nums.map((v, k) =>
+        k % 2 === 0
+          ? (abs ? mapX(m, v) : round2(v * m.sx))
+          : (abs ? mapY(m, v) : round2(v * m.sy))
+      );
+    }
+    // Later groups under one letter are implicit repeats (after M they mean L), so omit the letter
+    out.push(fresh ? `${cmd} ${mapped.join(' ')}` : mapped.join(' '));
+    fresh = false;
+    skipSep(); // numbers left after this group are implicit repeats of the same command
+  }
+  return out.join(' ');
+};
+
+// Returns a copy of `el` with its geometry scaled by `m`. Stroke widths are left alone.
+const scaleElement = (el: SVGElementData, m: ScaleMap): SVGElementData => {
+  switch (el.type) {
+    case 'rect':
+      return {
+        ...el,
+        x: mapX(m, el.x || 0), y: mapY(m, el.y || 0),
+        width: round2((el.width || 0) * m.sx), height: round2((el.height || 0) * m.sy)
+      };
+    case 'circle':
+      return { ...el, cx: mapX(m, el.cx || 0), cy: mapY(m, el.cy || 0), r: round2((el.r || 0) * m.sx) };
+    case 'line':
+      return {
+        ...el,
+        x1: mapX(m, el.x1 || 0), y1: mapY(m, el.y1 || 0),
+        x2: mapX(m, el.x2 || 0), y2: mapY(m, el.y2 || 0)
+      };
+    case 'polygon':
+      return {
+        ...el,
+        points: parsePoints(el.points).map(([x, y]) => `${mapX(m, x)},${mapY(m, y)}`).join(' ')
+      };
+    case 'path': {
+      const d = scalePathData(el.d || '', m);
+      return d === null ? el : { ...el, d };
+    }
+    case 'text':
+      return {
+        ...el,
+        x: mapX(m, el.x || 0), y: mapY(m, el.y || 0),
+        fontSize: Math.max(1, round2((el.fontSize ?? 16) * m.sx))
+      };
+    default:
+      return el;
+  }
+};
+
+type Corner = 'tl' | 'tr' | 'bl' | 'br';
+const CORNERS: Corner[] = ['tl', 'tr', 'br', 'bl'];
+const OPPOSITE: Record<Corner, Corner> = { tl: 'br', tr: 'bl', bl: 'tr', br: 'tl' };
+const MIN_RESIZE = 4; // smallest width/height (in canvas units) a drag can shrink a shape to
+
+const cornerPoint = (b: Box, c: Corner) => ({
+  x: c === 'tl' || c === 'bl' ? b.x : b.x + b.width,
+  y: c === 'tl' || c === 'tr' ? b.y : b.y + b.height
+});
+
+// Shapes that must keep their proportions (a circle stays a circle, text scales by font size)
+const isUniformOnly = (el: SVGElementData) => el.type === 'circle' || el.type === 'text';
+
+// The element's full transform (imported transform + rotation) as a matrix
+let matrixGroup: SVGGElement | null = null;
+const getElementMatrix = (el: SVGElementData): DOMMatrix => {
+  const tf = getTransform(el);
+  if (!tf || typeof document === 'undefined') return new DOMMatrix();
+  try {
+    if (!matrixGroup) {
+      const svg = document.createElementNS(SVG_NS, 'svg');
+      matrixGroup = document.createElementNS(SVG_NS, 'g');
+      svg.appendChild(matrixGroup);
+    }
+    matrixGroup.setAttribute('transform', tf);
+    const list = matrixGroup.transform.baseVal;
+    return list.numberOfItems ? DOMMatrix.fromMatrix(list.consolidate()!.matrix) : new DOMMatrix();
+  } catch {
+    return new DOMMatrix();
+  }
+};
+
+// Computes the resized copy of `orig` when `corner` is dragged to `pointer` (canvas coords).
+// `grab` is how far from the true bounding-box corner the user clicked, so the shape doesn't jump.
+const resizeElement = (
+  orig: SVGElementData,
+  box: Box,
+  corner: Corner,
+  inverse: DOMMatrix,
+  grab: { x: number; y: number },
+  pointer: { x: number; y: number },
+  keepAspect: boolean
+): SVGElementData => {
+  const p = inverse.transformPoint(pointer);
+  const handle = cornerPoint(box, corner);
+  const anchor = cornerPoint(box, OPPOSITE[corner]);
+  // Direction the dragged corner points away from the anchor (+1 / -1 per axis)
+  const dirX = handle.x >= anchor.x ? 1 : -1;
+  const dirY = handle.y >= anchor.y ? 1 : -1;
+
+  const wantW = Math.max(MIN_RESIZE, dirX * (p.x - grab.x - anchor.x));
+  const wantH = Math.max(MIN_RESIZE, dirY * (p.y - grab.y - anchor.y));
+  let sx = box.width > 1e-6 ? wantW / box.width : 1;
+  let sy = box.height > 1e-6 ? wantH / box.height : 1;
+
+  if (keepAspect || isUniformOnly(orig)) {
+    const flatX = box.width <= 1e-6, flatY = box.height <= 1e-6;
+    const s = flatX ? sy : flatY ? sx : Math.max(sx, sy);
+    sx = s;
+    sy = s;
+  }
+
+  const base: ScaleMap = { ax: anchor.x, ay: anchor.y, sx, sy, dx: 0, dy: 0 };
+  const rot = ((orig.rotation || 0) * Math.PI) / 180;
+  if (!rot) return scaleElement(orig, base);
+
+  // Rotation pivots on the bounding-box center, which moves as the box grows. Shift the
+  // geometry so the anchor corner stays put on screen: d = (I - R)(c_old - c_new).
+  const co = { x: box.x + box.width / 2, y: box.y + box.height / 2 };
+  const cn = { x: anchor.x + sx * (co.x - anchor.x), y: anchor.y + sy * (co.y - anchor.y) };
+  const vx = co.x - cn.x, vy = co.y - cn.y;
+  const cos = Math.cos(rot), sin = Math.sin(rot);
+  const dx = vx - (cos * vx - sin * vy);
+  const dy = vy - (sin * vx + cos * vy);
+  return scaleElement(orig, { ...base, dx, dy });
+};
+
 // Renders a single element to its one-line SVG markup (shared by elementsToSVG and
 // computeElementLineRanges so the two never drift out of sync with each other).
 const elementToLine = (el: SVGElementData): string => {
@@ -695,6 +890,16 @@ export default function SVGPaintStudio() {
     startClient: { x: number; y: number };
     moved: boolean;
   } | null>(null);
+  // Resizing the selected element by one of its corner handles
+  const resizeRef = useRef<{
+    id: string;
+    orig: SVGElementData;
+    box: Box;
+    corner: Corner;
+    inverse: DOMMatrix;
+    grab: { x: number; y: number };
+    moved: boolean;
+  } | null>(null);
   // Drawing a new shape: `base` is the array to fall back to if the gesture turns out to be a plain click
   const drawRef = useRef<{
     id: string;
@@ -1033,6 +1238,26 @@ export default function SVGPaintStudio() {
     };
   };
 
+  // Start resizing: grab one of the four corner handles of the selected shape
+  const handleResizeMouseDown = (e: React.MouseEvent, corner: Corner) => {
+    if (e.button !== 0) return;
+    e.stopPropagation();
+    commitHistory(); // close any uncommitted slider / code edit first
+    const id = selectedIdRef.current;
+    const orig = elementsRef.current.find(el => el.id === id);
+    const box = orig && getElementBBox(orig);
+    if (!orig || !box) return;
+    const inverse = getElementMatrix(orig).inverse();
+    const local = inverse.transformPoint(getCanvasCoords(e));
+    if (!Number.isFinite(local.x) || !Number.isFinite(local.y)) return; // degenerate transform, can't invert
+    const hit = cornerPoint(box, corner);
+    resizeRef.current = {
+      id: orig.id, orig, box, corner, inverse,
+      grab: { x: local.x - hit.x, y: local.y - hit.y },
+      moved: false
+    };
+  };
+
   const handleMouseDown = (e: React.MouseEvent<SVGSVGElement>) => {
     if (e.button !== 0) return;
     commitHistory();
@@ -1118,6 +1343,16 @@ export default function SVGPaintStudio() {
   };
 
   const handleMouseMove = (e: React.MouseEvent<SVGSVGElement>) => {
+    // Resizing the selected element (proportional by default; hold Shift to stretch freely)
+    const rs = resizeRef.current;
+    if (rs) {
+      rs.moved = true;
+      const resized = resizeElement(rs.orig, rs.box, rs.corner, rs.inverse, rs.grab, getCanvasCoords(e), !e.shiftKey);
+      setElements(elementsRef.current.map(el => (el.id === rs.id ? resized : el)));
+      if (resized.type === 'text' && resized.fontSize !== undefined) setFontSize(Math.round(resized.fontSize));
+      return;
+    }
+
     // Moving an existing element
     const drag = dragRef.current;
     if (drag) {
@@ -1162,6 +1397,14 @@ export default function SVGPaintStudio() {
   };
 
   const handleMouseUp = () => {
+    // Finish resizing: one undo step for the whole drag
+    const rs = resizeRef.current;
+    if (rs) {
+      resizeRef.current = null;
+      if (rs.moved) commitHistory();
+      return;
+    }
+
     // Finish moving an element: one undo step for the whole drag
     const drag = dragRef.current;
     if (drag) {
@@ -1251,6 +1494,31 @@ export default function SVGPaintStudio() {
   const selectedElement = elements.find(el => el.id === selectedId);
   const isTextSelected = selectedElement?.type === 'text';
   const showTextPanel = activeTool === 'text' || isTextSelected;
+
+  // Corner resize handles for the selected shape: positioned in canvas space (so they follow
+  // rotation and imported transforms) and sized in screen pixels (so zoom doesn't shrink them).
+  const resizeHandles = (() => {
+    if (activeTool !== 'select' || !selectedElement) return null;
+    const box = getElementBBox(selectedElement);
+    if (!box || (box.width <= 0 && box.height <= 0)) return null;
+    const m = getElementMatrix(selectedElement);
+    const vbWidth = parseFloat(canvasSettings.viewBox.split(/[\s,]+/)[2]);
+    const unitsPerPx = (vbWidth > 0 && canvasSettings.width > 0 ? vbWidth / canvasSettings.width : 1) / zoomLevel;
+    const pad = 4 + (selectedElement.strokeWidth || 0) / 2; // same padding as the dashed outline
+    const center = m.transformPoint({ x: box.x + box.width / 2, y: box.y + box.height / 2 });
+    return {
+      size: 10 * unitsPerPx,
+      items: CORNERS.map(corner => {
+        const pt = cornerPoint(box, corner);
+        const w = m.transformPoint({
+          x: corner === 'tl' || corner === 'bl' ? pt.x - pad : pt.x + pad,
+          y: corner === 'tl' || corner === 'tr' ? pt.y - pad : pt.y + pad
+        });
+        const cursor = (w.x - center.x) * (w.y - center.y) > 0 ? 'nwse-resize' : 'nesw-resize';
+        return { corner, x: w.x, y: w.y, cursor };
+      })
+    };
+  })();
   const dashOptions = DASH_STYLES.some(d => d.value === strokeDash)
     ? DASH_STYLES
     : [...DASH_STYLES, { label: `Custom (${strokeDash})`, value: strokeDash }];
@@ -1533,6 +1801,18 @@ export default function SVGPaintStudio() {
                           </g>
                         );
                       })}
+
+                      {/* Corner handles: drag to resize the selected shape proportionally (hold Shift to stretch freely) */}
+                      {resizeHandles && resizeHandles.items.map(h => (
+                        <rect
+                          key={h.corner}
+                          x={h.x - resizeHandles.size / 2} y={h.y - resizeHandles.size / 2}
+                          width={resizeHandles.size} height={resizeHandles.size}
+                          fill="#ffffff" stroke="#3b82f6" strokeWidth={resizeHandles.size * 0.15}
+                          style={{ cursor: h.cursor }}
+                          onMouseDown={(e) => handleResizeMouseDown(e, h.corner)}
+                        />
+                      ))}
 
                       {/* Realtime Drawing Preview Path for Pencil Tool */}
                       {isDrawing && activeTool === 'pencil' && currentPoints.length > 1 && (
