@@ -31,7 +31,9 @@ import {
   Check,
   Sparkles,
   FileText,
-  RotateCw
+  RotateCw,
+  Group,
+  Ungroup
 } from 'lucide-react';
 
 // Type definitions for elements, tools, and styles
@@ -39,7 +41,7 @@ type ToolType = 'select' | 'pencil' | 'line' | 'rect' | 'circle' | 'triangle' | 
 
 interface SVGElementData {
   id: string;
-  type: 'path' | 'line' | 'rect' | 'circle' | 'polygon' | 'text';
+  type: 'path' | 'line' | 'rect' | 'circle' | 'polygon' | 'text' | 'group';
   // Common attributes
   fill: string;
   fillOpacity: number;
@@ -59,6 +61,8 @@ interface SVGElementData {
   textContent?: string; fontSize?: number; fontFamily?: string; fontWeight?: string; fontStyle?: string; // for text
   textAnchor?: 'start' | 'middle' | 'end'; // for text
   rotation?: number;
+  children?: SVGElementData[]; // for group: the shapes it holds, in the group's own coordinate space
+  name?: string; // for group: label shown in the layer list (e.g. the imported file's name)
 }
 
 interface CanvasSettings {
@@ -80,6 +84,54 @@ interface Snapshot extends ExportSettings {
 }
 
 type Box = { x: number; y: number; width: number; height: number };
+
+/* ----------------------------- matrix helpers ----------------------------- */
+
+// 2D affine matrix in SVG order: matrix(a b c d e f), x' = a*x + c*y + e, y' = b*x + d*y + f
+type Mat = [number, number, number, number, number, number];
+const IDENTITY: Mat = [1, 0, 0, 1, 0, 0];
+
+// m * n: apply n first, then m (same as writing "m n" in an SVG transform list)
+const matMul = (m: Mat, n: Mat): Mat => [
+  m[0] * n[0] + m[2] * n[1], m[1] * n[0] + m[3] * n[1],
+  m[0] * n[2] + m[2] * n[3], m[1] * n[2] + m[3] * n[3],
+  m[0] * n[4] + m[2] * n[5] + m[4], m[1] * n[4] + m[3] * n[5] + m[5]
+];
+const matApply = (m: Mat, x: number, y: number) => ({
+  x: m[0] * x + m[2] * y + m[4],
+  y: m[1] * x + m[3] * y + m[5]
+});
+const rotateAbout = (deg: number, cx: number, cy: number): Mat => {
+  const a = (deg * Math.PI) / 180, cos = Math.cos(a), sin = Math.sin(a);
+  return [cos, sin, -sin, cos, cx - cos * cx + sin * cy, cy - sin * cx - cos * cy];
+};
+const scaleAbout = (sx: number, sy: number, ax: number, ay: number): Mat =>
+  [sx, 0, 0, sy, ax - sx * ax, ay - sy * ay];
+const matToString = (m: Mat) => `matrix(${m.map(n => Math.round(n * 10000) / 10000).join(' ')})`;
+
+// Parses an SVG transform list ("translate(10 5) rotate(30 50 50) ...") into one matrix.
+// Anything it can't read is skipped, so a bad string degrades to "no transform".
+const parseTransformList = (tf: string | undefined): Mat => {
+  let result: Mat = IDENTITY;
+  if (!tf) return result;
+  const re = /(matrix|translate|scale|rotate|skewX|skewY)\s*\(([^)]*)\)/gi;
+  let hit: RegExpExecArray | null;
+  while ((hit = re.exec(tf)) !== null) {
+    const a = hit[2].split(/[\s,]+/).filter(Boolean).map(parseFloat);
+    if (a.length === 0 || a.some(n => !Number.isFinite(n))) continue;
+    let m: Mat | null = null;
+    switch (hit[1].toLowerCase()) {
+      case 'matrix': if (a.length === 6) m = [a[0], a[1], a[2], a[3], a[4], a[5]]; break;
+      case 'translate': m = [1, 0, 0, 1, a[0], a[1] ?? 0]; break;
+      case 'scale': m = [a[0], 0, 0, a[1] ?? a[0], 0, 0]; break;
+      case 'rotate': m = rotateAbout(a[0], a[1] ?? 0, a[2] ?? 0); break;
+      case 'skewx': m = [1, 0, Math.tan((a[0] * Math.PI) / 180), 1, 0, 0]; break;
+      case 'skewy': m = [1, Math.tan((a[0] * Math.PI) / 180), 0, 1, 0, 0]; break;
+    }
+    if (m) result = matMul(result, m);
+  }
+  return result;
+};
 
 const PRESET_TEMPLATES = [
   {
@@ -238,9 +290,37 @@ const getElementBBox = (el: SVGElementData): Box | null => {
         },
         el.textContent || ''
       );
+    case 'group':
+      return childrenBox(el.children || []);
     default:
       return null;
   }
+};
+
+// An element's box after its own transform + rotation: where it really sits in its parent's space
+const getTransformedBox = (el: SVGElementData): Box | null => {
+  const b = getElementBBox(el);
+  if (!b) return null;
+  const m = parseTransformList(getTransform(el));
+  const pts = [
+    matApply(m, b.x, b.y), matApply(m, b.x + b.width, b.y),
+    matApply(m, b.x, b.y + b.height), matApply(m, b.x + b.width, b.y + b.height)
+  ];
+  const xs = pts.map(p => p.x), ys = pts.map(p => p.y);
+  const x = Math.min(...xs), y = Math.min(...ys);
+  return { x, y, width: Math.max(...xs) - x, height: Math.max(...ys) - y };
+};
+
+// Bounding box of several shapes together, in the space they all live in
+const childrenBox = (children: SVGElementData[]): Box | null => {
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  children.forEach(c => {
+    const b = getTransformedBox(c);
+    if (!b) return;
+    x0 = Math.min(x0, b.x); y0 = Math.min(y0, b.y);
+    x1 = Math.max(x1, b.x + b.width); y1 = Math.max(y1, b.y + b.height);
+  });
+  return Number.isFinite(x0) ? { x: x0, y: y0, width: x1 - x0, height: y1 - y0 } : null;
 };
 
 // Center of an element's geometry, used as the pivot for rotation
@@ -278,7 +358,9 @@ const shiftTransform = (transform: string | undefined, dx: number, dy: number): 
 // Returns a moved copy of an element. Plain shapes get their coordinates edited so the code stays tidy;
 // paths and anything already carrying a transform are moved with a translate() instead.
 const moveElement = (el: SVGElementData, dx: number, dy: number): SVGElementData => {
-  if (el.transform || el.type === 'path') return { ...el, transform: shiftTransform(el.transform, dx, dy) };
+  if (el.transform || el.type === 'path' || el.type === 'group') {
+    return { ...el, transform: shiftTransform(el.transform, dx, dy) };
+  }
   switch (el.type) {
     case 'rect':
       return { ...el, x: round2((el.x || 0) + dx), y: round2((el.y || 0) + dy) };
@@ -433,24 +515,8 @@ const cornerPoint = (b: Box, c: Corner) => ({
 // Shapes that must keep their proportions (a circle stays a circle, text scales by font size)
 const isUniformOnly = (el: SVGElementData) => el.type === 'circle' || el.type === 'text';
 
-// The element's full transform (imported transform + rotation) as a matrix
-let matrixGroup: SVGGElement | null = null;
-const getElementMatrix = (el: SVGElementData): DOMMatrix => {
-  const tf = getTransform(el);
-  if (!tf || typeof document === 'undefined') return new DOMMatrix();
-  try {
-    if (!matrixGroup) {
-      const svg = document.createElementNS(SVG_NS, 'svg');
-      matrixGroup = document.createElementNS(SVG_NS, 'g');
-      svg.appendChild(matrixGroup);
-    }
-    matrixGroup.setAttribute('transform', tf);
-    const list = matrixGroup.transform.baseVal;
-    return list.numberOfItems ? DOMMatrix.fromMatrix(list.consolidate()!.matrix) : new DOMMatrix();
-  } catch {
-    return new DOMMatrix();
-  }
-};
+// The element's full transform (imported transform + rotation) as a DOM matrix
+const getElementMatrix = (el: SVGElementData): DOMMatrix => new DOMMatrix(parseTransformList(getTransform(el)));
 
 // Computes the resized copy of `orig` when `corner` is dragged to `pointer` (canvas coords).
 // `grab` is how far from the true bounding-box corner the user clicked, so the shape doesn't jump.
@@ -480,6 +546,17 @@ const resizeElement = (
     const s = flatX ? sy : flatY ? sx : Math.max(sx, sy);
     sx = s;
     sy = s;
+  }
+
+  // A group isn't edited shape by shape: its own matrix absorbs the scale (strokes scale with it).
+  // New matrix M' = M * L with L the scale about the anchor in the group's local space; since
+  // M = T * Rot, that means T' = T * Rot * L * Rot^-1, which also keeps the anchor fixed on screen.
+  if (orig.type === 'group') {
+    const L = scaleAbout(sx, sy, anchor.x, anchor.y);
+    const rotDeg = orig.rotation || 0;
+    const cx = box.x + box.width / 2, cy = box.y + box.height / 2;
+    const X = rotDeg ? matMul(matMul(rotateAbout(rotDeg, cx, cy), L), rotateAbout(-rotDeg, cx, cy)) : L;
+    return { ...orig, transform: matToString(matMul(parseTransformList(orig.transform), X)) };
   }
 
   const base: ScaleMap = { ax: anchor.x, ay: anchor.y, sx, sy, dx: 0, dy: 0 };
@@ -526,6 +603,14 @@ const elementToLine = (el: SVGElementData): string => {
     case 'text': {
       const textStroke = el.stroke !== 'transparent' && el.strokeWidth > 0 ? ` ${strokeAttrs}` : '';
       return `  <text x="${el.x}" y="${el.y}" ${fillAttrs}${textStroke} font-size="${el.fontSize}" font-family="${esc(el.fontFamily)}" font-weight="${esc(el.fontWeight)}" font-style="${esc(el.fontStyle)}" text-anchor="${el.textAnchor || 'middle'}"${transformAttr}>${esc(el.textContent)}</text>`;
+    }
+    case 'group': {
+      const inner = (el.children || []).map(elementToLine).filter(Boolean).join('\n');
+      if (!inner) return '';
+      // data-group marks a group made in this editor so re-importing the code keeps it as one object
+      const indented = inner.split('\n').map(l => `  ${l}`).join('\n');
+      const nameAttr = el.name ? ` data-name="${esc(el.name)}"` : '';
+      return `  <g data-group="true"${nameAttr}${transformAttr}>\n${indented}\n  </g>`;
     }
     default:
       return '';
@@ -679,7 +764,12 @@ const parseSVGToElements = (svgString: string): { elements: SVGElementData[]; se
   const elements: SVGElementData[] = [];
   let counter = 0;
 
-  const traverse = (nodes: Element[], inherited: Record<string, string>, parentTransform: string) => {
+  const traverse = (
+    nodes: Element[],
+    inherited: Record<string, string>,
+    parentTransform: string,
+    out: SVGElementData[] = elements
+  ) => {
     nodes.forEach(node => {
       const tag = node.tagName.toLowerCase();
 
@@ -693,7 +783,23 @@ const parseSVGToElements = (svgString: string): { elements: SVGElementData[]; se
       const transform = [parentTransform, node.getAttribute('transform') || ''].filter(Boolean).join(' ');
 
       if (tag === 'g') {
-        traverse(Array.from(node.children), props, transform);
+        if (node.hasAttribute('data-group')) {
+          // A group made in this editor: keep it as one object. Its children are positioned
+          // relative to the group, so only the group itself carries the parent transform.
+          const children: SVGElementData[] = [];
+          traverse(Array.from(node.children), props, '', children);
+          if (children.length) {
+            out.push({
+              id: `group-${Date.now()}-${counter++}-${Math.random().toString(36).substring(2, 6)}`,
+              type: 'group', children,
+              fill: 'transparent', fillOpacity: 1, stroke: 'transparent', strokeWidth: 0, strokeOpacity: 1,
+              transform: transform || undefined, rotation: 0,
+              name: node.getAttribute('data-name') || undefined
+            });
+          }
+          return;
+        }
+        traverse(Array.from(node.children), props, transform, out);
         return;
       }
 
@@ -712,30 +818,30 @@ const parseSVGToElements = (svgString: string): { elements: SVGElementData[]; se
       };
 
       if (tag === 'path') {
-        elements.push({ ...base, type: 'path', d: node.getAttribute('d') || '' });
+        out.push({ ...base, type: 'path', d: node.getAttribute('d') || '' });
       } else if (tag === 'rect') {
-        elements.push({
+        out.push({
           ...base, type: 'rect',
           x: num(node.getAttribute('x'), 0), y: num(node.getAttribute('y'), 0),
           width: num(node.getAttribute('width'), 50), height: num(node.getAttribute('height'), 50),
           rx: num(node.getAttribute('rx'), 0)
         });
       } else if (tag === 'circle') {
-        elements.push({
+        out.push({
           ...base, type: 'circle',
           cx: num(node.getAttribute('cx'), 0), cy: num(node.getAttribute('cy'), 0), r: num(node.getAttribute('r'), 25)
         });
       } else if (tag === 'line') {
-        elements.push({
+        out.push({
           ...base, type: 'line',
           x1: num(node.getAttribute('x1'), 0), y1: num(node.getAttribute('y1'), 0),
           x2: num(node.getAttribute('x2'), 50), y2: num(node.getAttribute('y2'), 50)
         });
       } else if (tag === 'polyline' || tag === 'polygon') {
-        elements.push({ ...base, type: 'polygon', points: node.getAttribute('points') || '' });
+        out.push({ ...base, type: 'polygon', points: node.getAttribute('points') || '' });
       } else if (tag === 'text') {
         const anchor = props['text-anchor'];
-        elements.push({
+        out.push({
           ...base, type: 'text',
           x: num(node.getAttribute('x'), 0), y: num(node.getAttribute('y'), 0),
           textContent: (node.textContent || '').replace(/\s+/g, ' ').trim(),
@@ -755,6 +861,249 @@ const parseSVGToElements = (svgString: string): { elements: SVGElementData[]; se
     elements,
     settings: { width, height, viewBox, defs: defsParts.join('\n'), backgroundColor: 'transparent', showGrid: true }
   };
+};
+
+/* ------------------------- importing several files ------------------------- */
+
+const IMPORT_CELL = 400;   // each imported file is scaled to fit a square cell this big
+const IMPORT_GAP = 40;
+const IMPORT_MARGIN = 40;
+
+const escapeRegExp = (v: string) => v.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+// Two files can both define e.g. <linearGradient id="a">. Rename any id that is already taken (in the
+// defs markup and in every fill/stroke pointing at it) so each file keeps using its own definition.
+const renameDefIds = (
+  defs: string,
+  elements: SVGElementData[],
+  taken: Set<string>,
+  suffix: string
+): { defs: string; elements: SVGElementData[] } => {
+  const ids = Array.from(new Set(Array.from(defs.matchAll(/\sid="([^"]+)"/g), m => m[1])));
+  const renames = new Map<string, string>();
+  ids.forEach(id => {
+    if (!taken.has(id)) return;
+    let next = `${id}-${suffix}`;
+    for (let k = 2; taken.has(next) || ids.includes(next); k++) next = `${id}-${suffix}-${k}`;
+    renames.set(id, next);
+  });
+  ids.forEach(id => taken.add(renames.get(id) ?? id));
+  if (!renames.size) return { defs, elements };
+
+  const refPatterns = Array.from(renames, ([from, to]) => ({
+    to,
+    url: new RegExp(`url\\(\\s*(['"]?)#${escapeRegExp(from)}\\1\\s*\\)`, 'g'),
+    id: new RegExp(`(\\sid=")${escapeRegExp(from)}(")`, 'g'),
+    href: new RegExp(`(href=")#${escapeRegExp(from)}(")`, 'g')
+  }));
+  let newDefs = defs;
+  refPatterns.forEach(r => {
+    newDefs = newDefs
+      .replace(r.id, `$1${r.to}$2`)
+      .replace(r.url, `url(#${r.to})`)
+      .replace(r.href, `$1#${r.to}$2`);
+  });
+  const fixPaint = (v: string) => refPatterns.reduce((acc, r) => acc.replace(r.url, `url(#${r.to})`), v);
+  const fixElement = (el: SVGElementData): SVGElementData => ({
+    ...el,
+    fill: fixPaint(el.fill),
+    stroke: fixPaint(el.stroke),
+    children: el.children?.map(fixElement)
+  });
+  return { defs: newDefs, elements: elements.map(fixElement) };
+};
+
+// Turns the contents of several .svg files into one drawing. A single readable file loads exactly as
+// before (its own canvas size). With several, each file becomes its own named group, scaled to fit a
+// cell of a tidy grid, so the pieces can be moved, scaled and ungrouped independently.
+// `skipped` lists files that couldn't be read or had nothing drawable in them.
+const combineSvgFiles = (
+  files: { name: string; text: string }[]
+): { result: ReturnType<typeof parseSVGToElements> | null; skipped: string[] } => {
+  const skipped: string[] = [];
+  const parsed: { name: string; result: ReturnType<typeof parseSVGToElements> }[] = [];
+  files.forEach(f => {
+    try {
+      parsed.push({ name: f.name, result: parseSVGToElements(f.text) });
+    } catch {
+      skipped.push(f.name);
+    }
+  });
+
+  if (files.length === 1) return { result: parsed[0]?.result ?? null, skipped };
+
+  const usable = parsed.filter(p => {
+    if (p.result.elements.length) return true;
+    skipped.push(p.name);
+    return false;
+  });
+  if (usable.length === 0) return { result: null, skipped };
+  if (usable.length === 1) return { result: usable[0].result, skipped };
+
+  const cols = Math.min(4, Math.ceil(Math.sqrt(usable.length)));
+  const rows = Math.ceil(usable.length / cols);
+  const width = IMPORT_MARGIN * 2 + cols * IMPORT_CELL + (cols - 1) * IMPORT_GAP;
+  const height = IMPORT_MARGIN * 2 + rows * IMPORT_CELL + (rows - 1) * IMPORT_GAP;
+
+  const takenIds = new Set<string>();
+  const defsParts: string[] = [];
+  const groups: SVGElementData[] = usable.map(({ name, result }, i) => {
+    const { defs, elements } = renameDefIds(result.settings.defs, result.elements, takenIds, String(i + 1));
+    if (defs.trim()) defsParts.push(defs);
+
+    // Fit the file's viewBox inside its grid cell, centered
+    const [vx, vy, vw, vh] = result.settings.viewBox.split(/\s+/).map(Number);
+    const scale = Math.min(IMPORT_CELL / vw, IMPORT_CELL / vh);
+    const cellX = IMPORT_MARGIN + (i % cols) * (IMPORT_CELL + IMPORT_GAP);
+    const cellY = IMPORT_MARGIN + Math.floor(i / cols) * (IMPORT_CELL + IMPORT_GAP);
+    const tx = cellX + (IMPORT_CELL - vw * scale) / 2 - vx * scale;
+    const ty = cellY + (IMPORT_CELL - vh * scale) / 2 - vy * scale;
+
+    return {
+      id: makeId('group'), type: 'group', children: elements,
+      fill: 'transparent', fillOpacity: 1, stroke: 'transparent', strokeWidth: 0, strokeOpacity: 1,
+      transform: `translate(${round2(tx)} ${round2(ty)}) scale(${Math.round(scale * 10000) / 10000})`,
+      rotation: 0,
+      name: name.replace(/\.svg$/i, '')
+    };
+  });
+
+  return {
+    result: {
+      elements: groups,
+      settings: {
+        width, height, viewBox: `0 0 ${width} ${height}`, defs: defsParts.join('\n'),
+        backgroundColor: 'transparent', showGrid: true
+      }
+    },
+    skipped
+  };
+};
+
+/* -------------------------------------------------------------------------- */
+/*  Grouping                                                                  */
+/* -------------------------------------------------------------------------- */
+
+let idSeq = 0;
+const makeId = (prefix: string) => `${prefix}-${Date.now()}-${++idSeq}`;
+
+// Groups the elements whose ids are in `ids`. The group takes the stack position of the
+// topmost member and keeps the members' relative order. Needs at least two members.
+const groupElements = (
+  all: SVGElementData[],
+  ids: string[]
+): { elements: SVGElementData[]; groupId: string } | null => {
+  const picked = new Set(ids);
+  const members = all.filter(el => picked.has(el.id));
+  if (members.length < 2) return null;
+  const topIndex = Math.max(...members.map(m => all.indexOf(m)));
+  const group: SVGElementData = {
+    id: makeId('group'), type: 'group', children: members,
+    fill: 'transparent', fillOpacity: 1, stroke: 'transparent', strokeWidth: 0, strokeOpacity: 1,
+    rotation: 0
+  };
+  const elements: SVGElementData[] = [];
+  all.forEach((el, i) => {
+    if (i === topIndex) elements.push(group);
+    else if (!picked.has(el.id)) elements.push(el);
+  });
+  return { elements, groupId: group.id };
+};
+
+// Ungroups every selected group in place. Each child gets the group's transform (including its
+// rotation) put in front of its own, so nothing moves or changes size on screen.
+// `freed` lists everything that is selected afterwards.
+const ungroupElements = (
+  all: SVGElementData[],
+  ids: string[]
+): { elements: SVGElementData[]; freed: string[] } | null => {
+  const picked = new Set(ids);
+  if (!all.some(el => picked.has(el.id) && el.type === 'group')) return null;
+  const elements: SVGElementData[] = [];
+  const freed: string[] = [];
+  all.forEach(el => {
+    if (picked.has(el.id) && el.type === 'group') {
+      const groupTf = getTransform(el);
+      (el.children || []).forEach(child => {
+        const transform = [groupTf, child.transform].filter(Boolean).join(' ');
+        elements.push({ ...child, transform: transform || undefined });
+        freed.push(child.id);
+      });
+    } else {
+      elements.push(el);
+      if (picked.has(el.id)) freed.push(el.id);
+    }
+  });
+  return { elements, freed };
+};
+
+// Style edits made while a group (or several shapes) is selected: applied to every shape inside,
+// but only where the property is actually in use, so unfilled lines/pencil paths and unstroked
+// text don't suddenly pick up a fill or outline.
+const GROUP_STYLE_KEYS = new Set<string>([
+  'fill', 'fillOpacity', 'stroke', 'strokeOpacity', 'strokeWidth', 'strokeDasharray', 'rx'
+]);
+const hasPaint = (v: string | undefined) => !!v && v !== 'transparent' && v !== 'none';
+const applyStyleDeep = (el: SVGElementData, key: string, value: unknown): SVGElementData => {
+  if (el.type === 'group') {
+    return { ...el, children: (el.children || []).map(c => applyStyleDeep(c, key, value)) };
+  }
+  if ((key === 'fill' || key === 'fillOpacity') && !hasPaint(el.fill)) return el;
+  if (key.startsWith('stroke') && !hasPaint(el.stroke)) return el;
+  if (key === 'rx' && el.type !== 'rect') return el;
+  return { ...el, [key]: value };
+};
+
+// First real shape inside a group, used to show representative colors in the style panel
+const firstLeaf = (el: SVGElementData): SVGElementData =>
+  el.type === 'group' && el.children?.length ? firstLeaf(el.children[0]) : el;
+
+// Draws one element, recursing into groups. Shapes carry their own transform; a group
+// wraps its children in a <g> with the group's transform.
+const renderElementShape = (el: SVGElementData): React.ReactNode => {
+  const transform = getTransform(el);
+  const strokeAttrs = {
+    stroke: el.stroke,
+    strokeWidth: el.strokeWidth,
+    strokeOpacity: el.strokeOpacity,
+    strokeDasharray: el.strokeDasharray,
+    strokeLinecap: el.strokeLinecap,
+    strokeLinejoin: el.strokeLinejoin,
+  };
+  switch (el.type) {
+    case 'group':
+      return (
+        <g transform={transform}>
+          {(el.children || []).map(child => (
+            <React.Fragment key={child.id}>{renderElementShape(child)}</React.Fragment>
+          ))}
+        </g>
+      );
+    case 'path':
+      return <path d={el.d} fill={el.fill} fillOpacity={el.fillOpacity} {...strokeAttrs} transform={transform} />;
+    case 'rect':
+      return <rect x={el.x} y={el.y} width={el.width} height={el.height} rx={el.rx || 0} fill={el.fill} fillOpacity={el.fillOpacity} {...strokeAttrs} transform={transform} />;
+    case 'circle':
+      return <circle cx={el.cx} cy={el.cy} r={el.r} fill={el.fill} fillOpacity={el.fillOpacity} {...strokeAttrs} transform={transform} />;
+    case 'line':
+      return <line x1={el.x1} y1={el.y1} x2={el.x2} y2={el.y2} {...strokeAttrs} transform={transform} />;
+    case 'polygon':
+      return <polygon points={el.points} fill={el.fill} fillOpacity={el.fillOpacity} {...strokeAttrs} transform={transform} />;
+    case 'text':
+      return (
+        <text
+          x={el.x} y={el.y} fill={el.fill} fillOpacity={el.fillOpacity}
+          {...strokeAttrs}
+          fontSize={el.fontSize} fontFamily={el.fontFamily}
+          fontWeight={el.fontWeight} fontStyle={el.fontStyle}
+          textAnchor={el.textAnchor || 'middle'} transform={transform}
+        >
+          {el.textContent}
+        </text>
+      );
+    default:
+      return null;
+  }
 };
 
 /* -------------------------------------------------------------------------- */
@@ -841,7 +1190,12 @@ export default function SVGPaintStudio() {
 
   // Active Tool & Style Defaults
   const [activeTool, setActiveTool] = useState<ToolType>('select');
-  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [selectedIds, setSelectedIds] = useState<string[]>([]);
+  // Most of the editor works on one shape at a time: this is null while nothing or several are selected
+  const selectedId = selectedIds.length === 1 ? selectedIds[0] : null;
+  const setSelectedId = useCallback((id: string | null) => setSelectedIds(id ? [id] : []), []);
+  // Rubber-band box being dragged on empty canvas (Select tool) to pick several shapes
+  const [marquee, setMarquee] = useState<Box | null>(null);
 
   // Default drawing properties (also mirror the selected element while one is selected)
   const [fillColor, setFillColor] = useState<string>('#3b82f6');
@@ -884,11 +1238,18 @@ export default function SVGPaintStudio() {
   const skipCodeSyncRef = useRef<boolean>(false);
   // Moving an existing element with the Select tool
   const dragRef = useRef<{
-    id: string;
-    orig: SVGElementData;
+    items: { id: string; orig: SVGElementData }[]; // everything being dragged (the whole selection)
     start: { x: number; y: number };
     startClient: { x: number; y: number };
     moved: boolean;
+    collapseTo: string | null; // plain click on one of several selected shapes narrows the selection to it
+  } | null>(null);
+  // Rubber-band selection in progress
+  const marqueeRef = useRef<{
+    start: { x: number; y: number };
+    startClient: { x: number; y: number };
+    base: string[]; // selection to add to when Shift is held
+    box: Box | null;
   } | null>(null);
   // Resizing the selected element by one of its corner handles
   const resizeRef = useRef<{
@@ -919,6 +1280,10 @@ export default function SVGPaintStudio() {
   histRef.current = hist;
   const selectedIdRef = useRef(selectedId);
   selectedIdRef.current = selectedId;
+  const selectedIdsRef = useRef<string[]>([]);
+  useEffect(() => {
+    selectedIdsRef.current = selectedIds;
+  }, [selectedIds]);
 
   /* ------------------------------ history ------------------------------ */
 
@@ -1065,8 +1430,9 @@ export default function SVGPaintStudio() {
   // Select an element and load its style into the side-panel controls
   const selectElement = useCallback((id: string) => {
     setSelectedId(id);
-    const el = elementsRef.current.find(e => e.id === id);
-    if (!el) return;
+    const found = elementsRef.current.find(e => e.id === id);
+    if (!found) return;
+    const el = firstLeaf(found); // a group shows the style of the first shape inside it
     setFillColor(el.fill);
     setStrokeColor(el.stroke);
     setStrokeWidth(el.strokeWidth);
@@ -1080,23 +1446,44 @@ export default function SVGPaintStudio() {
       setIsBold(isBoldWeight(el.fontWeight));
       setIsItalic(el.fontStyle === 'italic');
     }
-  }, []);
+  }, [setSelectedId]);
 
   // Property updates for the selected shape. Continuous controls call this without `commit`
   // (live preview) and commit on release; discrete controls pass commit = true.
   const updateSelectedElement = <K extends keyof SVGElementData>(key: K, value: SVGElementData[K], commit = false) => {
-    const id = selectedIdRef.current;
-    if (!id || !elementsRef.current.some(el => el.id === id)) return;
-    const next = elementsRef.current.map(el => (el.id === id ? ({ ...el, [key]: value } as SVGElementData) : el));
+    const ids = new Set(selectedIdsRef.current);
+    if (!elementsRef.current.some(el => ids.has(el.id))) return;
+    const several = ids.size > 1;
+    const next = elementsRef.current.map(el => {
+      if (!ids.has(el.id)) return el;
+      // Style changes reach every shape inside a group, or every shape in a multi-selection
+      if (GROUP_STYLE_KEYS.has(key) && (el.type === 'group' || several)) return applyStyleDeep(el, key, value);
+      return { ...el, [key]: value } as SVGElementData;
+    });
     if (commit) commitElements(next);
     else setElements(next);
   };
 
   const deleteSelected = useCallback(() => {
-    const id = selectedIdRef.current;
-    if (!id) return;
-    commitElements(elementsRef.current.filter(el => el.id !== id));
-    setSelectedId(null);
+    const ids = new Set(selectedIdsRef.current);
+    if (!ids.size) return;
+    commitElements(elementsRef.current.filter(el => !ids.has(el.id)));
+    setSelectedIds([]);
+  }, [commitElements]);
+
+  // Group the selected shapes into one object / split selected groups back into their shapes
+  const groupSelected = useCallback(() => {
+    const result = groupElements(elementsRef.current, selectedIdsRef.current);
+    if (!result) return;
+    commitElements(result.elements);
+    setSelectedIds([result.groupId]);
+  }, [commitElements]);
+
+  const ungroupSelected = useCallback(() => {
+    const result = ungroupElements(elementsRef.current, selectedIdsRef.current);
+    if (!result) return;
+    commitElements(result.elements);
+    setSelectedIds(result.freed);
   }, [commitElements]);
 
   // Layer order operations
@@ -1125,8 +1512,7 @@ export default function SVGPaintStudio() {
   };
 
   // Replace the whole drawing (preset or imported file) as a single undoable step
-  const loadSvgString = (svg: string) => {
-    const parsed = parseSVGToElements(svg);
+  const loadParsed = (parsed: ReturnType<typeof parseSVGToElements>) => {
     clearPendingCommit();
     setElements(parsed.elements);
     applyParsedSettings(parsed.settings);
@@ -1140,18 +1526,29 @@ export default function SVGPaintStudio() {
     });
   };
 
+  const loadSvgString = (svg: string) => loadParsed(parseSVGToElements(svg));
+
+  // Import one or more .svg files. Several files land on one canvas, each as its own group.
   const handleImportFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    e.target.value = ''; // allow importing the same file again
-    if (!file) return;
+    const files = Array.from(e.target.files ?? []);
+    e.target.value = ''; // allow importing the same files again
+    if (!files.length) return;
     try {
-      const text = await new Promise<string>((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onload = () => resolve(String(reader.result));
-        reader.onerror = () => reject(reader.error);
-        reader.readAsText(file);
-      });
-      loadSvgString(text);
+      const contents = await Promise.all(files.map(async f => ({ name: f.name, text: await f.text() })));
+      const { result, skipped } = combineSvgFiles(contents);
+      if (!result) {
+        flashNotice(
+          files.length === 1
+            ? 'Could not import: that file is not valid SVG.'
+            : 'Could not import: none of those files could be read as SVG.'
+        );
+        return;
+      }
+      loadParsed(result);
+      if (skipped.length) {
+        const shown = skipped.slice(0, 3).join(', ') + (skipped.length > 3 ? ', ...' : '');
+        flashNotice(`Skipped ${skipped.length} file${skipped.length > 1 ? 's' : ''} with nothing to import: ${shown}`);
+      }
     } catch {
       flashNotice('Could not import: that file is not valid SVG.');
     }
@@ -1196,7 +1593,11 @@ export default function SVGPaintStudio() {
       } else if (mod && key === 'y') {
         e.preventDefault();
         redo();
-      } else if ((e.key === 'Delete' || e.key === 'Backspace') && selectedIdRef.current) {
+      } else if (mod && key === 'g') {
+        e.preventDefault(); // Ctrl+G groups, Ctrl+Shift+G ungroups
+        if (e.shiftKey) ungroupSelected();
+        else groupSelected();
+      } else if ((e.key === 'Delete' || e.key === 'Backspace') && selectedIdsRef.current.length) {
         e.preventDefault();
         deleteSelected();
       } else if (e.key === 'Escape') {
@@ -1205,7 +1606,7 @@ export default function SVGPaintStudio() {
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [undo, redo, deleteSelected]);
+  }, [undo, redo, deleteSelected, groupSelected, ungroupSelected, setSelectedId]);
 
   /* ------------------------------- canvas ------------------------------- */
 
@@ -1221,20 +1622,28 @@ export default function SVGPaintStudio() {
     return { x: round2(p.x), y: round2(p.y) };
   };
 
-  // Start moving an element (Select tool). Clicking a shape selects it; dragging moves it.
+  // Start moving shapes (Select tool). Clicking a shape selects it; dragging moves it (and the rest
+  // of the selection with it). Shift/Ctrl/Cmd-click adds or removes a shape from the selection.
   const handleElementMouseDown = (e: React.MouseEvent, id: string) => {
     if (activeTool !== 'select' || e.button !== 0) return;
     e.stopPropagation();
     commitHistory(); // close any uncommitted slider / code edit first
-    selectElement(id);
-    const orig = elementsRef.current.find(el => el.id === id);
-    if (!orig) return;
+    if (e.shiftKey || e.ctrlKey || e.metaKey) {
+      setSelectedIds(prev => (prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]));
+      return;
+    }
+    const current = selectedIdsRef.current;
+    const keepSelection = current.length > 1 && current.includes(id);
+    const ids = keepSelection ? current : [id];
+    if (!keepSelection) selectElement(id);
+    const items = elementsRef.current.filter(el => ids.includes(el.id)).map(el => ({ id: el.id, orig: el }));
+    if (!items.length) return;
     dragRef.current = {
-      id,
-      orig,
+      items,
       start: getCanvasCoords(e),
       startClient: { x: e.clientX, y: e.clientY },
-      moved: false
+      moved: false,
+      collapseTo: keepSelection ? id : null
     };
   };
 
@@ -1265,7 +1674,14 @@ export default function SVGPaintStudio() {
     setDragStart(coords);
 
     if (activeTool === 'select') {
-      setSelectedId(null); // click on empty canvas deselects
+      // Click on empty canvas deselects (Shift keeps the selection); dragging draws a selection box
+      if (!e.shiftKey) setSelectedIds([]);
+      marqueeRef.current = {
+        start: coords,
+        startClient: { x: e.clientX, y: e.clientY },
+        base: e.shiftKey ? selectedIdsRef.current : [],
+        box: null
+      };
       return;
     }
 
@@ -1359,8 +1775,22 @@ export default function SVGPaintStudio() {
       if (!drag.moved && Math.hypot(e.clientX - drag.startClient.x, e.clientY - drag.startClient.y) < 3) return;
       drag.moved = true;
       const c = getCanvasCoords(e);
-      const moved = moveElement(drag.orig, round2(c.x - drag.start.x), round2(c.y - drag.start.y));
-      setElements(elementsRef.current.map(el => (el.id === drag.id ? moved : el)));
+      const dx = round2(c.x - drag.start.x), dy = round2(c.y - drag.start.y);
+      const moved = new Map(drag.items.map(it => [it.id, moveElement(it.orig, dx, dy)]));
+      setElements(elementsRef.current.map(el => moved.get(el.id) ?? el));
+      return;
+    }
+
+    // Rubber-band selection
+    const mq = marqueeRef.current;
+    if (mq) {
+      if (!mq.box && Math.hypot(e.clientX - mq.startClient.x, e.clientY - mq.startClient.y) < 3) return;
+      const c = getCanvasCoords(e);
+      mq.box = {
+        x: Math.min(mq.start.x, c.x), y: Math.min(mq.start.y, c.y),
+        width: Math.abs(c.x - mq.start.x), height: Math.abs(c.y - mq.start.y)
+      };
+      setMarquee(mq.box);
       return;
     }
 
@@ -1410,6 +1840,26 @@ export default function SVGPaintStudio() {
     if (drag) {
       dragRef.current = null;
       if (drag.moved) commitHistory();
+      else if (drag.collapseTo) selectElement(drag.collapseTo);
+      return;
+    }
+
+    // Finish the selection box: select every shape that fits entirely inside it
+    const mq = marqueeRef.current;
+    if (mq) {
+      marqueeRef.current = null;
+      setMarquee(null);
+      const box = mq.box;
+      if (box) {
+        const inside = elementsRef.current.filter(el => {
+          const b = getTransformedBox(el);
+          return !!b && b.x >= box.x && b.y >= box.y &&
+            b.x + b.width <= box.x + box.width && b.y + b.height <= box.y + box.height;
+        }).map(el => el.id);
+        const ids = Array.from(new Set([...mq.base, ...inside]));
+        if (ids.length === 1) selectElement(ids[0]);
+        else setSelectedIds(ids);
+      }
       return;
     }
 
@@ -1422,7 +1872,7 @@ export default function SVGPaintStudio() {
       if (currentPoints.length > 1) {
         const d = currentPoints.reduce((acc, pt, idx) => `${acc} ${idx === 0 ? 'M' : 'L'} ${pt.x} ${pt.y}`, '');
         const newEl: SVGElementData = {
-          id: `path-${Date.now()}`,
+          id: makeId('path'),
           type: 'path',
           d,
           fill: 'transparent', fillOpacity: 1,
@@ -1449,7 +1899,7 @@ export default function SVGPaintStudio() {
     if (activeTool !== 'eraser') return;
     e.stopPropagation();
     commitElements(elementsRef.current.filter(el => el.id !== id));
-    if (selectedId === id) setSelectedId(null);
+    setSelectedIds(prev => prev.filter(x => x !== id));
   };
 
   // Copy code feedback
@@ -1493,6 +1943,22 @@ export default function SVGPaintStudio() {
 
   const selectedElement = elements.find(el => el.id === selectedId);
   const isTextSelected = selectedElement?.type === 'text';
+  const canGroup = selectedIds.length > 1;
+  const canUngroup = elements.some(el => selectedIds.includes(el.id) && el.type === 'group');
+
+  // Dashed box around a multi-selection, so it's clear what Group would combine
+  const multiBox = (() => {
+    if (activeTool !== 'select' || selectedIds.length < 2) return null;
+    const boxes = elements
+      .filter(el => selectedIds.includes(el.id))
+      .map(getTransformedBox)
+      .filter((b): b is Box => !!b);
+    if (!boxes.length) return null;
+    const x0 = Math.min(...boxes.map(b => b.x)), y0 = Math.min(...boxes.map(b => b.y));
+    const x1 = Math.max(...boxes.map(b => b.x + b.width)), y1 = Math.max(...boxes.map(b => b.y + b.height));
+    const pad = 8;
+    return { x: x0 - pad, y: y0 - pad, width: x1 - x0 + pad * 2, height: y1 - y0 + pad * 2 };
+  })();
   const showTextPanel = activeTool === 'text' || isTextSelected;
 
   // Corner resize handles for the selected shape: positioned in canvas space (so they follow
@@ -1566,13 +2032,14 @@ export default function SVGPaintStudio() {
             ref={fileInputRef}
             type="file"
             accept=".svg,image/svg+xml"
+            multiple
             className="hidden"
             onChange={handleImportFile}
           />
           <button
             onClick={() => fileInputRef.current?.click()}
             className="flex items-center gap-1.5 px-3 py-1.5 text-xs bg-slate-700 hover:bg-slate-600 text-slate-200 rounded font-medium transition"
-            title="Import an SVG file"
+            title="Import one or more SVG files (several files are placed side by side, each as its own group)"
           >
             <Upload className="w-3.5 h-3.5" /> Import
           </button>
@@ -1593,6 +2060,26 @@ export default function SVGPaintStudio() {
             title="Redo (Ctrl+Shift+Z)"
           >
             <Redo className="w-4 h-4" />
+          </button>
+
+          <div className="h-5 w-px bg-slate-700 mx-1" />
+
+          {/* Group / Ungroup */}
+          <button
+            onClick={groupSelected}
+            disabled={!canGroup}
+            className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs text-slate-300 hover:text-white bg-slate-700/50 hover:bg-slate-700 disabled:opacity-40 disabled:hover:bg-slate-700/50 disabled:hover:text-slate-300 rounded transition"
+            title="Group selected shapes (Ctrl+G). Shift-click shapes or drag a box on empty canvas to select several."
+          >
+            <Group className="w-4 h-4" /> Group
+          </button>
+          <button
+            onClick={ungroupSelected}
+            disabled={!canUngroup}
+            className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs text-slate-300 hover:text-white bg-slate-700/50 hover:bg-slate-700 disabled:opacity-40 disabled:hover:bg-slate-700/50 disabled:hover:text-slate-300 rounded transition"
+            title="Ungroup (Ctrl+Shift+G)"
+          >
+            <Ungroup className="w-4 h-4" /> Ungroup
           </button>
 
           <div className="h-5 w-px bg-slate-700 mx-1" />
@@ -1750,16 +2237,7 @@ export default function SVGPaintStudio() {
 
                       {/* Rendered SVG Elements */}
                       {elements.map((el) => {
-                        const isSelected = selectedId === el.id;
-                        const strokeAttrs = {
-                          stroke: el.stroke,
-                          strokeWidth: el.strokeWidth,
-                          strokeOpacity: el.strokeOpacity,
-                          strokeDasharray: el.strokeDasharray,
-                          strokeLinecap: el.strokeLinecap,
-                          strokeLinejoin: el.strokeLinejoin,
-                        };
-
+                        const isSelected = selectedIds.includes(el.id);
                         const transform = getTransform(el);
 
                         return (
@@ -1769,32 +2247,7 @@ export default function SVGPaintStudio() {
                             onClick={(e) => handleElementClick(e, el.id)}
                             style={{ cursor: activeTool === 'select' ? 'move' : undefined }}
                           >
-                            {el.type === 'path' && (
-                              <path d={el.d} fill={el.fill} fillOpacity={el.fillOpacity} {...strokeAttrs} transform={transform} />
-                            )}
-                            {el.type === 'rect' && (
-                              <rect x={el.x} y={el.y} width={el.width} height={el.height} rx={el.rx || 0} fill={el.fill} fillOpacity={el.fillOpacity} {...strokeAttrs} transform={transform} />
-                            )}
-                            {el.type === 'circle' && (
-                              <circle cx={el.cx} cy={el.cy} r={el.r} fill={el.fill} fillOpacity={el.fillOpacity} {...strokeAttrs} transform={transform} />
-                            )}
-                            {el.type === 'line' && (
-                              <line x1={el.x1} y1={el.y1} x2={el.x2} y2={el.y2} {...strokeAttrs} transform={transform} />
-                            )}
-                            {el.type === 'polygon' && (
-                              <polygon points={el.points} fill={el.fill} fillOpacity={el.fillOpacity} {...strokeAttrs} transform={transform} />
-                            )}
-                            {el.type === 'text' && (
-                              <text
-                                x={el.x} y={el.y} fill={el.fill} fillOpacity={el.fillOpacity}
-                                {...strokeAttrs}
-                                fontSize={el.fontSize} fontFamily={el.fontFamily}
-                                fontWeight={el.fontWeight} fontStyle={el.fontStyle}
-                                textAnchor={el.textAnchor || 'middle'} transform={transform}
-                              >
-                                {el.textContent}
-                              </text>
-                            )}
+                            {renderElementShape(el)}
 
                             {/* Selection outline for every element type (follows the element's transform) */}
                             {isSelected && <SelectionOutline el={el} transform={transform} />}
@@ -1813,6 +2266,22 @@ export default function SVGPaintStudio() {
                           onMouseDown={(e) => handleResizeMouseDown(e, h.corner)}
                         />
                       ))}
+
+                      {/* Box around a multi-selection, and the rubber-band box while dragging one */}
+                      {multiBox && (
+                        <rect
+                          className="pointer-events-none"
+                          x={multiBox.x} y={multiBox.y} width={multiBox.width} height={multiBox.height}
+                          fill="none" stroke="#3b82f6" strokeWidth="1" strokeDasharray="6 3"
+                        />
+                      )}
+                      {marquee && (
+                        <rect
+                          className="pointer-events-none"
+                          x={marquee.x} y={marquee.y} width={marquee.width} height={marquee.height}
+                          fill="#3b82f6" fillOpacity="0.1" stroke="#3b82f6" strokeWidth="1" strokeDasharray="4 3"
+                        />
+                      )}
 
                       {/* Realtime Drawing Preview Path for Pencil Tool */}
                       {isDrawing && activeTool === 'pencil' && currentPoints.length > 1 && (
@@ -2150,6 +2619,39 @@ export default function SVGPaintStudio() {
             </div>
           )}
 
+          {/* MULTI-SELECTION */}
+          {selectedIds.length > 1 && (
+            <div className="p-4 border-b border-slate-700 space-y-3 bg-slate-800/50">
+              <div className="flex items-center justify-between">
+                <h3 className="font-semibold text-slate-200 text-xs tracking-wider uppercase">
+                  {selectedIds.length} Shapes Selected
+                </h3>
+                <button
+                  onClick={deleteSelected}
+                  className="text-rose-400 hover:text-rose-300 p-1 hover:bg-slate-700 rounded"
+                  title="Delete Selected (Del)"
+                >
+                  <Trash2 className="w-4 h-4" />
+                </button>
+              </div>
+              <p className="text-slate-400">Drag to move them together. Group them to scale them as one.</p>
+              <button
+                onClick={groupSelected}
+                className="w-full flex items-center justify-center gap-1.5 px-3 py-1.5 bg-blue-600 hover:bg-blue-500 text-white rounded font-medium transition"
+              >
+                <Group className="w-4 h-4" /> Group (Ctrl+G)
+              </button>
+              {canUngroup && (
+                <button
+                  onClick={ungroupSelected}
+                  className="w-full flex items-center justify-center gap-1.5 px-3 py-1.5 bg-slate-700 hover:bg-slate-600 text-slate-200 rounded font-medium transition"
+                >
+                  <Ungroup className="w-4 h-4" /> Ungroup selected groups
+                </button>
+              )}
+            </div>
+          )}
+
           {/* ELEMENT INSPECTOR */}
           {selectedElement && (
             <div className="p-4 border-b border-slate-700 space-y-3 bg-slate-800/50">
@@ -2165,6 +2667,21 @@ export default function SVGPaintStudio() {
                   <Trash2 className="w-4 h-4" />
                 </button>
               </div>
+
+              {selectedElement.type === 'group' && (
+                <div className="space-y-2">
+                  <p className="text-slate-400">
+                    Group of {selectedElement.children?.length ?? 0} shapes. Drag a corner handle to scale it
+                    (hold Shift to stretch freely).
+                  </p>
+                  <button
+                    onClick={ungroupSelected}
+                    className="w-full flex items-center justify-center gap-1.5 px-3 py-1.5 bg-slate-700 hover:bg-slate-600 text-slate-200 rounded font-medium transition"
+                  >
+                    <Ungroup className="w-4 h-4" /> Ungroup (Ctrl+Shift+G)
+                  </button>
+                </div>
+              )}
 
               {/* Rotation Handle */}
               <LabeledSlider
@@ -2242,18 +2759,26 @@ export default function SVGPaintStudio() {
                 <div className="p-4 text-center text-slate-500 text-xs">No shapes on canvas</div>
               ) : (
                 [...elements].reverse().map((el) => {
-                  const isSelected = selectedId === el.id;
+                  const isSelected = selectedIds.includes(el.id);
                   return (
                     <div
                       key={el.id}
-                      onClick={() => selectElement(el.id)}
+                      onClick={(e) => {
+                        if (e.shiftKey || e.ctrlKey || e.metaKey) {
+                          setSelectedIds(prev => (prev.includes(el.id) ? prev.filter(x => x !== el.id) : [...prev, el.id]));
+                        } else {
+                          selectElement(el.id);
+                        }
+                      }}
                       className={`px-3 py-2 flex items-center justify-between cursor-pointer transition ${
                         isSelected ? 'bg-blue-600/20 text-blue-300 font-medium' : 'text-slate-400 hover:bg-slate-800/60'
                       }`}
                     >
                       <span className="capitalize flex items-center gap-2">
-                        <FileText className="w-3.5 h-3.5 opacity-60" />
-                        {el.type}
+                        {el.type === 'group'
+                          ? <Group className="w-3.5 h-3.5 opacity-60" />
+                          : <FileText className="w-3.5 h-3.5 opacity-60" />}
+                        {el.type === 'group' ? `${el.name || 'group'} (${el.children?.length ?? 0})` : el.type}
                       </span>
                       <span className="text-slate-500 font-mono" style={{ fontSize: 10 }}>
                         {el.id.split('-')[2] || ''}
