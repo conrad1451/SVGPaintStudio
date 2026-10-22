@@ -62,6 +62,7 @@ interface SVGElementData {
   textAnchor?: 'start' | 'middle' | 'end'; // for text
   rotation?: number;
   children?: SVGElementData[]; // for group: the shapes it holds, in the group's own coordinate space
+  name?: string; // for group: label shown in the layer list (e.g. the imported file's name)
 }
 
 interface CanvasSettings {
@@ -608,7 +609,8 @@ const elementToLine = (el: SVGElementData): string => {
       if (!inner) return '';
       // data-group marks a group made in this editor so re-importing the code keeps it as one object
       const indented = inner.split('\n').map(l => `  ${l}`).join('\n');
-      return `  <g data-group="true"${transformAttr}>\n${indented}\n  </g>`;
+      const nameAttr = el.name ? ` data-name="${esc(el.name)}"` : '';
+      return `  <g data-group="true"${nameAttr}${transformAttr}>\n${indented}\n  </g>`;
     }
     default:
       return '';
@@ -791,7 +793,8 @@ const parseSVGToElements = (svgString: string): { elements: SVGElementData[]; se
               id: `group-${Date.now()}-${counter++}-${Math.random().toString(36).substring(2, 6)}`,
               type: 'group', children,
               fill: 'transparent', fillOpacity: 1, stroke: 'transparent', strokeWidth: 0, strokeOpacity: 1,
-              transform: transform || undefined, rotation: 0
+              transform: transform || undefined, rotation: 0,
+              name: node.getAttribute('data-name') || undefined
             });
           }
           return;
@@ -857,6 +860,123 @@ const parseSVGToElements = (svgString: string): { elements: SVGElementData[]; se
   return {
     elements,
     settings: { width, height, viewBox, defs: defsParts.join('\n'), backgroundColor: 'transparent', showGrid: true }
+  };
+};
+
+/* ------------------------- importing several files ------------------------- */
+
+const IMPORT_CELL = 400;   // each imported file is scaled to fit a square cell this big
+const IMPORT_GAP = 40;
+const IMPORT_MARGIN = 40;
+
+const escapeRegExp = (v: string) => v.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+// Two files can both define e.g. <linearGradient id="a">. Rename any id that is already taken (in the
+// defs markup and in every fill/stroke pointing at it) so each file keeps using its own definition.
+const renameDefIds = (
+  defs: string,
+  elements: SVGElementData[],
+  taken: Set<string>,
+  suffix: string
+): { defs: string; elements: SVGElementData[] } => {
+  const ids = Array.from(new Set(Array.from(defs.matchAll(/\sid="([^"]+)"/g), m => m[1])));
+  const renames = new Map<string, string>();
+  ids.forEach(id => {
+    if (!taken.has(id)) return;
+    let next = `${id}-${suffix}`;
+    for (let k = 2; taken.has(next) || ids.includes(next); k++) next = `${id}-${suffix}-${k}`;
+    renames.set(id, next);
+  });
+  ids.forEach(id => taken.add(renames.get(id) ?? id));
+  if (!renames.size) return { defs, elements };
+
+  const refPatterns = Array.from(renames, ([from, to]) => ({
+    to,
+    url: new RegExp(`url\\(\\s*(['"]?)#${escapeRegExp(from)}\\1\\s*\\)`, 'g'),
+    id: new RegExp(`(\\sid=")${escapeRegExp(from)}(")`, 'g'),
+    href: new RegExp(`(href=")#${escapeRegExp(from)}(")`, 'g')
+  }));
+  let newDefs = defs;
+  refPatterns.forEach(r => {
+    newDefs = newDefs
+      .replace(r.id, `$1${r.to}$2`)
+      .replace(r.url, `url(#${r.to})`)
+      .replace(r.href, `$1#${r.to}$2`);
+  });
+  const fixPaint = (v: string) => refPatterns.reduce((acc, r) => acc.replace(r.url, `url(#${r.to})`), v);
+  const fixElement = (el: SVGElementData): SVGElementData => ({
+    ...el,
+    fill: fixPaint(el.fill),
+    stroke: fixPaint(el.stroke),
+    children: el.children?.map(fixElement)
+  });
+  return { defs: newDefs, elements: elements.map(fixElement) };
+};
+
+// Turns the contents of several .svg files into one drawing. A single readable file loads exactly as
+// before (its own canvas size). With several, each file becomes its own named group, scaled to fit a
+// cell of a tidy grid, so the pieces can be moved, scaled and ungrouped independently.
+// `skipped` lists files that couldn't be read or had nothing drawable in them.
+const combineSvgFiles = (
+  files: { name: string; text: string }[]
+): { result: ReturnType<typeof parseSVGToElements> | null; skipped: string[] } => {
+  const skipped: string[] = [];
+  const parsed: { name: string; result: ReturnType<typeof parseSVGToElements> }[] = [];
+  files.forEach(f => {
+    try {
+      parsed.push({ name: f.name, result: parseSVGToElements(f.text) });
+    } catch {
+      skipped.push(f.name);
+    }
+  });
+
+  if (files.length === 1) return { result: parsed[0]?.result ?? null, skipped };
+
+  const usable = parsed.filter(p => {
+    if (p.result.elements.length) return true;
+    skipped.push(p.name);
+    return false;
+  });
+  if (usable.length === 0) return { result: null, skipped };
+  if (usable.length === 1) return { result: usable[0].result, skipped };
+
+  const cols = Math.min(4, Math.ceil(Math.sqrt(usable.length)));
+  const rows = Math.ceil(usable.length / cols);
+  const width = IMPORT_MARGIN * 2 + cols * IMPORT_CELL + (cols - 1) * IMPORT_GAP;
+  const height = IMPORT_MARGIN * 2 + rows * IMPORT_CELL + (rows - 1) * IMPORT_GAP;
+
+  const takenIds = new Set<string>();
+  const defsParts: string[] = [];
+  const groups: SVGElementData[] = usable.map(({ name, result }, i) => {
+    const { defs, elements } = renameDefIds(result.settings.defs, result.elements, takenIds, String(i + 1));
+    if (defs.trim()) defsParts.push(defs);
+
+    // Fit the file's viewBox inside its grid cell, centered
+    const [vx, vy, vw, vh] = result.settings.viewBox.split(/\s+/).map(Number);
+    const scale = Math.min(IMPORT_CELL / vw, IMPORT_CELL / vh);
+    const cellX = IMPORT_MARGIN + (i % cols) * (IMPORT_CELL + IMPORT_GAP);
+    const cellY = IMPORT_MARGIN + Math.floor(i / cols) * (IMPORT_CELL + IMPORT_GAP);
+    const tx = cellX + (IMPORT_CELL - vw * scale) / 2 - vx * scale;
+    const ty = cellY + (IMPORT_CELL - vh * scale) / 2 - vy * scale;
+
+    return {
+      id: makeId('group'), type: 'group', children: elements,
+      fill: 'transparent', fillOpacity: 1, stroke: 'transparent', strokeWidth: 0, strokeOpacity: 1,
+      transform: `translate(${round2(tx)} ${round2(ty)}) scale(${Math.round(scale * 10000) / 10000})`,
+      rotation: 0,
+      name: name.replace(/\.svg$/i, '')
+    };
+  });
+
+  return {
+    result: {
+      elements: groups,
+      settings: {
+        width, height, viewBox: `0 0 ${width} ${height}`, defs: defsParts.join('\n'),
+        backgroundColor: 'transparent', showGrid: true
+      }
+    },
+    skipped
   };
 };
 
@@ -1392,8 +1512,7 @@ export default function SVGPaintStudio() {
   };
 
   // Replace the whole drawing (preset or imported file) as a single undoable step
-  const loadSvgString = (svg: string) => {
-    const parsed = parseSVGToElements(svg);
+  const loadParsed = (parsed: ReturnType<typeof parseSVGToElements>) => {
     clearPendingCommit();
     setElements(parsed.elements);
     applyParsedSettings(parsed.settings);
@@ -1407,18 +1526,29 @@ export default function SVGPaintStudio() {
     });
   };
 
+  const loadSvgString = (svg: string) => loadParsed(parseSVGToElements(svg));
+
+  // Import one or more .svg files. Several files land on one canvas, each as its own group.
   const handleImportFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    e.target.value = ''; // allow importing the same file again
-    if (!file) return;
+    const files = Array.from(e.target.files ?? []);
+    e.target.value = ''; // allow importing the same files again
+    if (!files.length) return;
     try {
-      const text = await new Promise<string>((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onload = () => resolve(String(reader.result));
-        reader.onerror = () => reject(reader.error);
-        reader.readAsText(file);
-      });
-      loadSvgString(text);
+      const contents = await Promise.all(files.map(async f => ({ name: f.name, text: await f.text() })));
+      const { result, skipped } = combineSvgFiles(contents);
+      if (!result) {
+        flashNotice(
+          files.length === 1
+            ? 'Could not import: that file is not valid SVG.'
+            : 'Could not import: none of those files could be read as SVG.'
+        );
+        return;
+      }
+      loadParsed(result);
+      if (skipped.length) {
+        const shown = skipped.slice(0, 3).join(', ') + (skipped.length > 3 ? ', ...' : '');
+        flashNotice(`Skipped ${skipped.length} file${skipped.length > 1 ? 's' : ''} with nothing to import: ${shown}`);
+      }
     } catch {
       flashNotice('Could not import: that file is not valid SVG.');
     }
@@ -1902,13 +2032,14 @@ export default function SVGPaintStudio() {
             ref={fileInputRef}
             type="file"
             accept=".svg,image/svg+xml"
+            multiple
             className="hidden"
             onChange={handleImportFile}
           />
           <button
             onClick={() => fileInputRef.current?.click()}
             className="flex items-center gap-1.5 px-3 py-1.5 text-xs bg-slate-700 hover:bg-slate-600 text-slate-200 rounded font-medium transition"
-            title="Import an SVG file"
+            title="Import one or more SVG files (several files are placed side by side, each as its own group)"
           >
             <Upload className="w-3.5 h-3.5" /> Import
           </button>
@@ -2647,7 +2778,7 @@ export default function SVGPaintStudio() {
                         {el.type === 'group'
                           ? <Group className="w-3.5 h-3.5 opacity-60" />
                           : <FileText className="w-3.5 h-3.5 opacity-60" />}
-                        {el.type === 'group' ? `group (${el.children?.length ?? 0})` : el.type}
+                        {el.type === 'group' ? `${el.name || 'group'} (${el.children?.length ?? 0})` : el.type}
                       </span>
                       <span className="text-slate-500 font-mono" style={{ fontSize: 10 }}>
                         {el.id.split('-')[2] || ''}
